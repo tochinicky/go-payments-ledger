@@ -8,6 +8,10 @@ import (
 	"github.com/google/uuid"
 )
 
+// Book is an in-memory ledger. Rule for Version (it becomes account_seq in events): exactly one bump per account
+// per ledger operation that changes the account's money, posted or held: place, capture, release and expire
+// of a hold, and each side of a transfer.
+//
 // Book is an in-memory ledger. It applies the same rules the database-backed ledger will, and it's the
 // reference model for the property-based tests: random commands against the Book must never break an invariant,
 // and (from slice 2) the database must always agree with it. Not safe for concurrent use.
@@ -46,11 +50,22 @@ func (b *Book) OpenAccount(partnerID uuid.UUID, kind AccountKind, currency Curre
 	return a, nil
 }
 
-// CloseAccount stops an account from moving money (its history stays).
+// CloseAccount stops an account from moving money (its history stays). Only an empty account can be closed:
+// otherwise its money would be stranded, and an active hold on it could still be captured. A settlement account
+// can't be closed at all, since its balance mirrors the customers' money. Closing a closed account is a no-op.
 func (b *Book) CloseAccount(partnerID, accountID uuid.UUID) error {
 	a, err := b.account(partnerID, accountID)
 	if err != nil {
 		return err
+	}
+	if a.Status == StatusClosed {
+		return nil
+	}
+	if a.Kind == KindSettlement {
+		return ErrAccountNotClosable
+	}
+	if balance := b.balances[a.ID]; balance.Posted != 0 || balance.Held != 0 { // held == 0 ⇒ no active holds
+		return ErrAccountNotEmpty
 	}
 	a.Status = StatusClosed
 	b.accounts[a.ID] = a
@@ -110,6 +125,11 @@ func (b *Book) CaptureHold(partnerID, holdID uuid.UUID, amount int64) (Hold, Tra
 	}
 	if b.accounts[h.ToAccountID].Status != StatusActive {
 		return Hold{}, Transaction{}, ErrHoldNotCapturable // the hold stays active
+	}
+	// Unreachable while the closure rule holds (an account with an active hold isn't empty, so it can't be closed);
+	// kept so a closed account can never change balance even if that rule is ever loosened.
+	if b.accounts[h.AccountID].Status != StatusActive {
+		return Hold{}, Transaction{}, ErrAccountNotActive
 	}
 
 	// Release the whole reservation, then post the captured part. Available goes up by (hold − captured), never down,
@@ -253,13 +273,21 @@ func (b *Book) CheckInvariants() error {
 			errs = append(errs, fmt.Errorf("invariant 1, transaction %s: %w", tx.ID, err))
 		}
 		for _, p := range tx.Postings {
-			posted[p.AccountID] += p.Amount.Amount
+			sum, ok := addInt64(posted[p.AccountID], p.Amount.Amount)
+			if !ok {
+				errs = append(errs, fmt.Errorf("invariant 2, account %s: the sum of its postings overflows", p.AccountID))
+			}
+			posted[p.AccountID] = sum
 		}
 	}
 	held := map[uuid.UUID]int64{}
 	for _, h := range b.holds {
 		if h.Status == HoldActive {
-			held[h.AccountID] += h.Amount.Amount
+			sum, ok := addInt64(held[h.AccountID], h.Amount.Amount)
+			if !ok {
+				errs = append(errs, fmt.Errorf("invariant 4, account %s: the sum of its holds overflows", h.AccountID))
+			}
+			held[h.AccountID] = sum
 		}
 		if h.Captured > h.Amount.Amount || (h.Status != HoldCaptured && h.Captured != 0) {
 			errs = append(errs, fmt.Errorf("invariant 4, hold %s: captured %d of %d (%s)", h.ID, h.Captured, h.Amount.Amount, h.Status))

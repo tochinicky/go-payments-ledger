@@ -27,7 +27,7 @@ func TestMain(m *testing.M) {
 
 // expectedErrors are the business refusals random commands can legitimately get. Anything else is a bug.
 var expectedErrors = []error{
-	ErrInsufficientFunds, ErrSameAccount, ErrNotFound, ErrAccountNotActive,
+	ErrInsufficientFunds, ErrSameAccount, ErrNotFound, ErrAccountNotActive, ErrAccountNotEmpty, ErrAccountNotClosable,
 	ErrHoldNotActive, ErrHoldNotCapturable, ErrCaptureExceedsHold, ErrInvalidAmount,
 }
 
@@ -109,10 +109,16 @@ func TestRandomCommandSequencesNeverBreakAnInvariant(t *testing.T) {
 				book.ExpireHolds(now)
 			case 6:
 				if rapid.IntRange(0, 4).Draw(t, "close?") == 0 {
-					err = book.CloseAccount(p.id, pickAccount("close"))
+					id := pickAccount("close")
+					err = book.CloseAccount(p.id, id)
+					if err == nil {
+						if a, balance, _ := book.Account(p.id, id); a.Status != StatusClosed || balance.Posted != 0 || balance.Held != 0 {
+							t.Fatalf("step %d: closed account %s isn't empty: %+v", step, id, balance)
+						}
+					}
 				}
 			}
-			if err != nil && !expected(err) {
+			if errors.Is(err, ErrOverflow) || (err != nil && !expected(err)) {
 				t.Fatalf("step %d: unexpected error %v", step, err)
 			}
 

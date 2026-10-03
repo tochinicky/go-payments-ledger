@@ -161,6 +161,37 @@ func TestAnotherPartnerSeesNotFoundExactlyLikeAMissingAccount(t *testing.T) {
 	}
 }
 
+func TestOnlyAnEmptyCustomerAccountCanBeClosed(t *testing.T) {
+	p := newPartnerBook(t)
+	p.fund(t, p.alice, 1_000)
+
+	if err := p.CloseAccount(p.partner, p.alice); !errors.Is(err, ErrAccountNotEmpty) {
+		t.Errorf("funded: %v, want ErrAccountNotEmpty (the money would be stranded)", err)
+	}
+	if err := p.CloseAccount(p.partner, p.settlement); !errors.Is(err, ErrAccountNotClosable) {
+		t.Errorf("settlement: %v, want ErrAccountNotClosable", err)
+	}
+
+	// Move everything out but keep a hold: still not empty.
+	h := must[Hold](t)(p.PlaceHold(p.partner, p.alice, p.bob, eur(400), noon.Add(time.Hour)))
+	if _, err := p.Transfer(p.partner, p.alice, p.bob, eur(600)); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.CloseAccount(p.partner, p.alice); !errors.Is(err, ErrAccountNotEmpty) {
+		t.Errorf("an active hold: %v, want ErrAccountNotEmpty (the hold could still be captured)", err)
+	}
+
+	if _, _, err := p.CaptureHold(p.partner, h.ID, 400); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.CloseAccount(p.partner, p.alice); err != nil {
+		t.Errorf("empty: %v", err)
+	}
+	if err := p.CloseAccount(p.partner, p.alice); err != nil {
+		t.Errorf("closing again is a no-op: %v", err)
+	}
+}
+
 func TestAClosedAccountCantSendOrReceive(t *testing.T) {
 	p := newPartnerBook(t)
 	p.fund(t, p.alice, 1_000)
