@@ -1,0 +1,30 @@
+# golangci-lint v2. CI fails on any finding.
+version: "2"
+
+linters:
+  default: standard            # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose                # HTTP response bodies are closed
+    - errorlint                # errors compared with errors.Is/As, wrapped with %w
+    - gosec                    # security smells (a bank API)
+    - misspell
+    - noctx                    # HTTP requests carry a context
+    - revive                   # idiomatic Go: names, comments on exported identifiers
+    - sqlclosecheck            # rows and statements are closed
+    - rowserrcheck             # rows.Err() is checked
+    - unconvert
+    - unparam
+  settings:
+    revive:
+      rules:
+        - name: exported
+        - name: package-comments
+        - name: error-return
+        - name: error-naming
+        - name: context-as-argument   # ctx comes first
+        - name: unexported-return
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
