@@ -51,3 +51,21 @@ The decisions the build depends on, each with its reason:
 - **Crashes are real (a subprocess exit or SIGKILL), never a context cancellation**, which runs the graceful paths and tests a polite stop.
 - **Kafka outage = broker stop/start with a fixed host port** (the advertised listener survives); pause/unpause is a second variant. Not Toxiproxy: Kafka hands out advertised addresses.
 - **New scenario 8, "commit outcome unknown":** freeing a key after a 5xx is conditional on its own lease token, and never touches a completed row. **The test proves the logic** (a hook does the real commit, then reports a lost ack); **the demo proves the mechanism** (Toxiproxy resets the connection after COMMIT).
+
+---
+
+## Slice 1: money and the double-entry core
+
+- **`Money` is `int64` minor units + a currency; arithmetic is checked.** `Add`, `Sub` and `Neg` return an error instead of wrapping round: in Go, `math.MaxInt64 + 1` silently becomes a huge negative number, which in a ledger would be a balance flipping sign. `Neg(math.MinInt64)` is the subtle case: it has no positive counterpart.
+- **Supported currencies are a fixed table** (EUR, USD, GBP, CHF: 2 decimals; JPY: 0). Unknown codes are refused rather than guessed.
+- **`ParseMoney` is strict:** an optional `-`, digits, and at most the currency's decimals. No `+`, spaces, exponents or separators. The API takes `amount_minor` as an integer; parsing is for the CLI and tests, and strictness is safer than guessing. It accumulates as a negative number, so even the most negative amount parses without overflowing on the way.
+- **`FormatAmount` works on the decimal digits as text** (`strconv.FormatInt`). It needs no integer conversion, so it also formats `math.MinInt64`. The first version converted to `uint64`; the linter (gosec G115) flagged it and the rewrite is simpler.
+- **Business errors are values with stable codes** (`*ledger.Error{Code, Message}`, matched with `errors.Is` against sentinels). The codes are the API's error codes; a detailed message still matches its sentinel.
+- **An in-memory `Book` is the reference model.** It applies exactly the rules the database-backed ledger will. The property test checks it against the invariants now; from slice 2 the database must agree with it.
+- **`CheckInvariants` is the reconciliation logic in miniature:** postings sum to zero per transaction (1), posted = sum of postings (2), available ≥ floor (3), held = sum of active holds and captures ≤ holds (4).
+- **A capture releases the whole reservation and posts the captured part**, so it needs no funds check (the money was reserved when the hold was placed), and available can only go up. It's all-or-nothing: if posting fails, the reservation is restored.
+- **Account `Version` goes up by one on every change** (posted or held). It becomes `account_seq` in events.
+- **Tests:**
+  - **unit tests** per rule;
+  - **a rapid property test**: random sequences of transfers, holds, captures, releases, expiries and closures over two partners, checking all invariants plus per-partner money conservation **after every step**, and that every refusal is a known business error. It runs **1,000 sequences** by default (`TestMain`; an explicit `-rapid.checks` wins). Removing the funds check on holds made it fail at once, shrunk to the minimal case (a single hold one cent too large);
+  - **fuzz tests** for parsing (round trip) and addition (against exact `math/big` arithmetic).

@@ -2,7 +2,7 @@
 
 A double-entry ledger service in Go: accounts, idempotent transfers and holds, a transactional outbox to Kafka, and an inbox-based consumer, built so that money can't be created, lost or moved twice.
 
-> **Status:** slice 0 (toolchain, skeleton, CI).
+> **Status:** slice 1 (money and the double-entry core) built; the database, API, events and operations slices follow.
 
 ## Toolchain
 
