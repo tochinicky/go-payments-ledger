@@ -75,6 +75,14 @@ func TestEveryEntryWritesOneEvent(t *testing.T) {
 		{events.HoldExpired, 70, 440, 0, false},
 	}
 	got := outboxOf(t, alice)
+	// Summing each delta over the account's events gives exactly its balances, whatever the event types.
+	var posted, held int64
+	for _, e := range got {
+		posted, held = posted+e.PostedDeltaMinor, held+e.HeldDeltaMinor
+	}
+	if b := f.balance(t, alice); posted != b.Posted || held != b.Held {
+		t.Errorf("deltas sum to posted %d, held %d; balance is %+v", posted, held, b)
+	}
 	if len(got) != len(want) {
 		t.Fatalf("%d events for alice, want %d: %+v", len(got), len(want), got)
 	}

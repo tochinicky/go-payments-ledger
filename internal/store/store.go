@@ -318,6 +318,7 @@ func (tx Tx) apply(ctx context.Context, e entry) (db.ApplyToBalanceRow, error) {
 	payload, err := json.Marshal(events.Event{
 		EventID: id, EventType: e.eventType, SchemaVersion: events.SchemaVersion, PartnerID: e.partnerID, AccountID: e.accountID,
 		TransactionID: e.txID, TransactionKind: kind, HoldID: e.holdID, AmountMinor: e.amount, Currency: string(e.currency),
+		PostedDeltaMinor: e.postedDelta, HeldDeltaMinor: e.heldDelta,
 		PostedBalanceAfter: b.PostedMinor, HeldBalanceAfter: b.HeldMinor, AccountSeq: b.Version,
 	})
 	if err != nil {
