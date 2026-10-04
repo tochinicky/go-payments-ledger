@@ -235,4 +235,11 @@ The decisions the build depends on, each with its reason:
 - **Rejected: Postgres group commit (`commit_delay`).** It made things worse (p99 8.5 s): making a commit wait to share a flush while it holds row locks lengthens every lock hold. Durability is not traded away: `synchronous_commit` stays on.
 - **The next step for the SLO** is fewer round trips while the locks are held: send a transfer's statements as one pipelined batch (pgx batches), or move the money movement into one server-side function, so lock hold time stops scaling with network round trips. A real database disk would also change the picture; a laptop VM's virtual disk is the worst case for WAL flushes.
 - **Connection pool metrics** (`db_pool_acquires`, `db_pool_waits`, `db_pool_wait_time_seconds`, `db_pool_in_use`, `db_pool_max`) are exported, since pool starvation is the first thing to rule out in any latency investigation.
+- **Kubernetes (kind): everything runs in the cluster**, with Postgres and Redpanda as single-replica, dev-grade StatefulSets ("in production: managed services"). The migrations, login roles and topic are Jobs that retry until what they need is up, since Kubernetes doesn't order Jobs; ledger-api's readiness waits for the schema version itself.
+- **The ledger-api Deployment:**
+  - 2 replicas, a PodDisruptionBudget of minAvailable 1, and a rolling update with no unavailability;
+  - liveness on `/healthz` and readiness on `/readyz`, on the admin port;
+  - `terminationGracePeriodSeconds` longer than the drain plus the longest request;
+  - non-root, read-only root filesystem, all capabilities dropped, the RuntimeDefault seccomp profile.
+- **The workers:** the relay runs 2 replicas (one leads), and the notifier runs 2 members of one consumer group. Secrets are a template with dev values; a real deployment creates them from its secret store. CI validates every manifest with kubeconform.
 

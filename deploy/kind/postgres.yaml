@@ -1,0 +1,46 @@
+# Dev-grade Postgres: one replica, no backups or failover. In production: a managed database.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: ledger
+spec:
+  selector: {app: postgres}
+  ports: [{name: postgres, port: 5432}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: ledger
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: {app: postgres}
+  template:
+    metadata:
+      labels: {app: postgres}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:18-alpine
+          env:
+            - {name: POSTGRES_USER, value: owner}
+            - {name: POSTGRES_DB, value: ledger}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: ledger-db, key: postgres-password}}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          ports: [{containerPort: 5432}]
+          readinessProbe:
+            exec: {command: ["pg_isready", "-U", "owner", "-d", "ledger"]}
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {memory: 512Mi}
+          volumeMounts: [{name: data, mountPath: /var/lib/postgresql/data}]
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: {requests: {storage: 1Gi}}

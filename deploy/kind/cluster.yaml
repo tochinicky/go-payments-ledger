@@ -1,0 +1,9 @@
+# kind create cluster --config deploy/kind/cluster.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: ledger
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080   # the API's NodePort, reachable at localhost:30080
+        hostPort: 30080

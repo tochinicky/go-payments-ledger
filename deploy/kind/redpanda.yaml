@@ -1,0 +1,62 @@
+# Dev-grade Redpanda: one broker in dev-container mode (no fsync). In production: a managed Kafka.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redpanda-bootstrap
+  namespace: ledger
+data:
+  .bootstrap.yaml: |
+    auto_create_topics_enabled: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redpanda
+  namespace: ledger
+spec:
+  selector: {app: redpanda}
+  ports: [{name: kafka, port: 9092}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redpanda
+  namespace: ledger
+spec:
+  serviceName: redpanda
+  replicas: 1
+  selector:
+    matchLabels: {app: redpanda}
+  template:
+    metadata:
+      labels: {app: redpanda}
+    spec:
+      containers:
+        - name: redpanda
+          image: docker.redpanda.com/redpandadata/redpanda:v26.2.3
+          args:
+            - redpanda
+            - start
+            - --mode=dev-container
+            - --smp=1
+            - --memory=1G
+            - --kafka-addr=0.0.0.0:9092
+            - --advertise-kafka-addr=redpanda:9092
+          ports: [{containerPort: 9092}]
+          readinessProbe:
+            exec: {command: ["sh", "-c", "rpk cluster health | grep -q 'Healthy:.*true'"]}
+            periodSeconds: 3
+          resources:
+            requests: {cpu: 250m, memory: 1Gi}
+            limits: {memory: 1536Mi}
+          volumeMounts:
+            - {name: bootstrap, mountPath: /etc/redpanda/.bootstrap.yaml, subPath: .bootstrap.yaml}
+            - {name: data, mountPath: /var/lib/redpanda/data}
+      volumes:
+        - name: bootstrap
+          configMap: {name: redpanda-bootstrap}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: {requests: {storage: 1Gi}}

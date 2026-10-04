@@ -1,0 +1,69 @@
+# The relay runs two replicas for availability: one holds the advisory lock and publishes, the other waits.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: relay
+  namespace: ledger
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: relay}
+  template:
+    metadata:
+      labels: {app: relay}
+    spec:
+      terminationGracePeriodSeconds: 20   # longer than the relay's SHUTDOWN_TIMEOUT (15 s)
+      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: relay
+          image: go-payments-ledger:dev
+          imagePullPolicy: Never
+          command: ["/usr/local/bin/relay"]
+          env:
+            - {name: KAFKA_BROKERS, value: "redpanda:9092"}
+            - name: DATABASE_URL
+              valueFrom: {secretKeyRef: {name: ledger-db, key: app-url}}
+          ports: [{name: admin, containerPort: 9091}]
+          livenessProbe:
+            httpGet: {path: /healthz, port: admin}
+          resources:
+            requests: {cpu: 100m, memory: 32Mi}
+            limits: {memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notifier
+  namespace: ledger
+spec:
+  replicas: 2   # members of one consumer group: the 6 partitions are shared between them
+  selector:
+    matchLabels: {app: notifier}
+  template:
+    metadata:
+      labels: {app: notifier}
+    spec:
+      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: notifier
+          image: go-payments-ledger:dev
+          imagePullPolicy: Never
+          command: ["/usr/local/bin/notifier"]
+          env:
+            - {name: KAFKA_BROKERS, value: "redpanda:9092"}
+            - name: DATABASE_URL
+              valueFrom: {secretKeyRef: {name: ledger-db, key: notifier-url}}
+          ports: [{name: admin, containerPort: 9092}]
+          livenessProbe:
+            httpGet: {path: /healthz, port: admin}
+          resources:
+            requests: {cpu: 100m, memory: 32Mi}
+            limits: {memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}

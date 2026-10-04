@@ -70,3 +70,12 @@ jobs:
       - run: docker build --build-arg COMMIT=${GITHUB_SHA::7} -t go-payments-ledger:ci .
       - run: docker run --rm --entrypoint /usr/local/bin/ledgerctl go-payments-ledger:ci 2>&1 | grep -q usage
 
+  # The Kubernetes manifests, validated against the API schemas.
+  manifests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: >
+          docker run --rm -v "$PWD/deploy/kind:/m" ghcr.io/yannh/kubeconform:v0.8.0
+          -strict -summary -ignore-filename-pattern 'cluster.yaml|kustomization.yaml' /m
+

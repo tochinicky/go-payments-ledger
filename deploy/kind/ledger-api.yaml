@@ -1,0 +1,80 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ledger-api
+  namespace: ledger
+data:
+  REQUEST_TIMEOUT: 10s
+  STATEMENT_TIMEOUT: 8s
+  LOCK_TIMEOUT: 5s
+  SHUTDOWN_DRAIN: 5s
+  IDEMPOTENCY_RETENTION: 24h
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledger-api
+  namespace: ledger
+spec:
+  type: NodePort
+  selector: {app: ledger-api}
+  ports:
+    - {name: http, port: 8080, nodePort: 30080}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ledger-api
+  namespace: ledger
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: ledger-api}
+  strategy:
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  template:
+    metadata:
+      labels: {app: ledger-api}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      # Longer than SHUTDOWN_DRAIN plus the longest request, so SIGTERM's drain always finishes before SIGKILL.
+      terminationGracePeriodSeconds: 30
+      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: ledger-api
+          image: go-payments-ledger:dev
+          imagePullPolicy: Never
+          envFrom: [{configMapRef: {name: ledger-api}}]
+          env:
+            - name: DATABASE_URL
+              valueFrom: {secretKeyRef: {name: ledger-db, key: app-url}}
+          ports:
+            - {name: http, containerPort: 8080}
+            - {name: admin, containerPort: 9090}
+          # Liveness never checks the database: an outage would restart every replica and turn it into a full outage.
+          livenessProbe:
+            httpGet: {path: /healthz, port: admin}
+            periodSeconds: 10
+          # Readiness: the database answers and the schema is at this build's migration version.
+          readinessProbe:
+            httpGet: {path: /readyz, port: admin}
+            periodSeconds: 3
+          resources:
+            requests: {cpu: 250m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ledger-api
+  namespace: ledger
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: ledger-api}
