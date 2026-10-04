@@ -42,10 +42,22 @@ type Tx struct {
 	q *db.Queries
 }
 
+// inTx runs fn in one database transaction and commits it. It never retries: after a commit error the outcome is
+// unknown (the commit may have happened and only its acknowledgement been lost), so retrying here could apply a
+// write twice. The client retries, with its idempotency key, and gets the stored answer if the commit did happen.
 func (s *Store) inTx(ctx context.Context, fn func(Tx) error) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		return fn(Tx{s: s, q: db.New(tx)})
-	})
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }() // a no-op once committed
+	if err := fn(Tx{s: s, q: db.New(tx)}); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return commitAckLost() // only in -tags faultinject builds: the commit happened, report that it didn't arrive
 }
 
 // Partner is a partner as the API sees it.

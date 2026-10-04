@@ -80,6 +80,7 @@ func buildFaultinjectBinaries() (string, error) {
 	builds := [][]string{
 		{"-tags", "faultinject", "-o", filepath.Join(dir, "relay"), "./cmd/relay"},
 		{"-tags", "faultinject", "-o", filepath.Join(dir, "notifier"), "./cmd/notifier"},
+		{"-tags", "faultinject", "-o", filepath.Join(dir, "ledger-api"), "./cmd/ledger-api"},
 		{"-o", filepath.Join(dir, "ledger-api-prod"), "./cmd/ledger-api"},
 		{"-o", filepath.Join(dir, "relay-prod"), "./cmd/relay"},
 	}

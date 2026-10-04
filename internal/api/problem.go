@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -101,16 +103,26 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	writeProblem(w, "internal", "")
 }
 
-// unavailable reports whether err means the database couldn't be reached or didn't answer in time (a connection
-// failure, the request's deadline, statement_timeout or lock_timeout), rather than a bug. All are worth retrying.
+// unavailable reports whether err means the database couldn't be reached, dropped the connection, or didn't answer
+// in time (the request's deadline, statement_timeout, lock_timeout), rather than a bug. All are worth retrying with
+// the same idempotency key, and none is stored.
 func unavailable(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch {
+		case strings.HasPrefix(pgErr.Code, "08"): // connection exception
+			return true
+		case pgErr.Code == "55P03", pgErr.Code == "57014": // lock_not_available, query_canceled
+			return true
+		case pgErr.Code == "57P01", pgErr.Code == "57P02", pgErr.Code == "57P03": // the server is shutting down or not accepting yet
+			return true
+		}
+	}
 	var netErr net.Error
 	var connectErr *pgconn.ConnectError
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && (pgErr.Code == "55P03" || pgErr.Code == "57014") { // lock_not_available, query_canceled
-		return true
-	}
-	return errors.As(err, &netErr) || errors.As(err, &connectErr) || pgconn.Timeout(err) || errors.Is(err, context.DeadlineExceeded)
+	return errors.As(err, &netErr) || errors.As(err, &connectErr) || pgconn.Timeout(err) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) // the connection dropped mid-conversation
 }
 
 // writeOK answers a read with 200 and a JSON body. (Writes answer through idempotent, which stores the response.)

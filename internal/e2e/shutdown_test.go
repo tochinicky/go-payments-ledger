@@ -54,6 +54,12 @@ func startProcess(t *testing.T, name string, env ...string) *exec.Cmd {
 	return p
 }
 
+// startFaultProcess starts a faultinject build with FAULT_POINT set.
+func startFaultProcess(t *testing.T, name, point string, env ...string) *exec.Cmd {
+	t.Helper()
+	return startProcess(t, name, append(env, "FAULT_POINT="+point)...)
+}
+
 func waitExit(t *testing.T, p *exec.Cmd, within time.Duration) (code int, took time.Duration) {
 	t.Helper()
 	began := time.Now()
