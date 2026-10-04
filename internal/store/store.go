@@ -8,10 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/tochinicky/go-payments-ledger/internal/events"
@@ -38,8 +41,17 @@ func NewID() uuid.UUID {
 // Tx is the ledger inside one database transaction: its operations commit or roll back together, with whatever
 // else the transaction does (such as completing an idempotency key).
 type Tx struct {
-	s *Store
-	q *db.Queries
+	s     *Store
+	q     *db.Queries
+	tx    pgx.Tx
+	later *pgx.Batch // statements whose results nobody needs, sent in one round trip just before COMMIT
+}
+
+// deferExec queues a statement to run in this transaction just before it commits, in the same round trip as the other
+// queued ones. For writes nothing reads back (an audit row, the idempotency completion): every round trip saved is
+// time the transaction's row locks are held for nothing.
+func (tx Tx) deferExec(sql string, args ...any) {
+	tx.later.Queue(sql, args...)
 }
 
 // inTx runs fn in one database transaction and commits it. It never retries: after a commit error the outcome is
@@ -51,8 +63,14 @@ func (s *Store) inTx(ctx context.Context, fn func(Tx) error) error {
 		return fmt.Errorf("begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }() // a no-op once committed
-	if err := fn(Tx{s: s, q: db.New(tx)}); err != nil {
+	t := Tx{s: s, q: db.New(tx), tx: tx, later: &pgx.Batch{}}
+	if err := fn(t); err != nil {
 		return err
+	}
+	if t.later.Len() > 0 {
+		if err := tx.SendBatch(ctx, t.later).Close(); err != nil {
+			return fmt.Errorf("deferred statements: %w", err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit: %w", err)
@@ -227,11 +245,38 @@ func (tx Tx) Transfer(ctx context.Context, partnerID, fromID, toID uuid.UUID, am
 	if err := ledger.ValidatePostings(postings); err != nil {
 		return Transfer{}, err
 	}
-	locked, err := lockAccounts(ctx, tx.q, partnerID, fromID, toID)
+	t := Transfer{ID: tx.s.newID(), From: fromID, To: toID, Amount: amount, Reference: reference}
+	err = tx.transferFast(ctx, partnerID, &t, postings)
+	if err == nil {
+		return t, nil
+	}
+	// Undo the attempt. If it was refused, or hit a data error (an overflow), the slow path applies the checks one
+	// by one in the Book's order, so a refusal gets exactly the Book's error. Anything else (a lock timeout, a lost
+	// connection) is returned as it is: retrying it here would only wait or fail again.
+	if _, rbErr := tx.tx.Exec(ctx, rollbackFast); rbErr != nil {
+		return Transfer{}, fmt.Errorf("roll back fast path (%w): %w", err, rbErr)
+	}
+	var pgErr *pgconn.PgError
+	dataError := errors.As(err, &pgErr) && strings.HasPrefix(pgErr.Code, "22")
+	if !errors.Is(err, errFastRefused) && !dataError {
+		return Transfer{}, err
+	}
+	return tx.transferSlow(ctx, partnerID, t, postings)
+}
+
+// slowTransfers counts transfers that took the slow path (refusals, mostly); tests use it to see which path ran.
+var slowTransfers atomic.Int64
+
+// transferSlow is the transfer one statement at a time: lock both balances in account-id order, check every rule
+// against the locked rows, then write. It decides every refusal, and applies a transfer the fast path couldn't.
+func (tx Tx) transferSlow(ctx context.Context, partnerID uuid.UUID, t Transfer, postings []ledger.Posting) (Transfer, error) {
+	slowTransfers.Add(1)
+	amount := t.Amount
+	locked, err := lockAccounts(ctx, tx.q, partnerID, t.From, t.To)
 	if err != nil {
 		return Transfer{}, err
 	}
-	from, to := locked[fromID], locked[toID]
+	from, to := locked[t.From], locked[t.To]
 	if from.Currency != amount.Currency || to.Currency != amount.Currency {
 		return Transfer{}, ledger.ErrCurrencyMismatch
 	}
@@ -244,9 +289,8 @@ func (tx Tx) Transfer(ctx context.Context, partnerID, fromID, toID uuid.UUID, am
 	if err := checkPosted(postings, locked); err != nil {
 		return Transfer{}, err
 	}
-	t := Transfer{ID: tx.s.newID(), From: fromID, To: toID, Amount: amount, Reference: reference}
 	created, err := tx.q.InsertTransaction(ctx, db.InsertTransactionParams{
-		ID: t.ID, PartnerID: partnerID, Kind: string(ledger.KindTransfer), Reference: reference,
+		ID: t.ID, PartnerID: partnerID, Kind: string(ledger.KindTransfer), Reference: t.Reference,
 	})
 	if err != nil {
 		return Transfer{}, fmt.Errorf("insert transaction: %w", err)

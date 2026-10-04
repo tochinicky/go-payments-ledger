@@ -28,11 +28,14 @@ func (e AuditEntry) params(id uuid.UUID) db.InsertAuditParams {
 	}
 }
 
-// Audit records an entry in the same transaction as the write it describes, so the two commit together.
-func (tx Tx) Audit(ctx context.Context, e AuditEntry) error {
-	if err := tx.q.InsertAudit(ctx, e.params(tx.s.newID())); err != nil {
-		return fmt.Errorf("audit: %w", err)
-	}
+// insertAudit is db.InsertAudit's statement, queued rather than run (see Tx.deferExec).
+const insertAudit = `INSERT INTO audit_log (id, partner_id, actor, action, resource, status, request_id) VALUES ($1, $2, $3, $4, $5, $6, $7)`
+
+// Audit records an entry in the same transaction as the write it describes, so the two commit together. It is
+// sent with the transaction's other deferred statements, just before COMMIT.
+func (tx Tx) Audit(_ context.Context, e AuditEntry) error {
+	p := e.params(tx.s.newID())
+	tx.deferExec(insertAudit, p.ID, p.PartnerID, p.Actor, p.Action, p.Resource, p.Status, p.RequestID)
 	return nil
 }
 

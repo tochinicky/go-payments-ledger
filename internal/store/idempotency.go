@@ -120,16 +120,20 @@ func (s *Store) RunWithLease(ctx context.Context, lease Lease, work func(Tx) (Re
 		if err != nil {
 			return err
 		}
-		code := int32(resp.Status) //nolint:gosec // an HTTP status fits
-		return tx.q.CompleteKey(ctx, db.CompleteKeyParams{
-			PartnerID: lease.PartnerID, Key: lease.Key, LeaseToken: &lease.Token, ResponseCode: &code, ResponseBody: resp.Body,
-		})
+		// Deferred: sent with the audit row in one round trip just before COMMIT.
+		tx.deferExec(completeKey, lease.PartnerID, lease.Key, &lease.Token, int32(resp.Status), resp.Body) //nolint:gosec // an HTTP status fits
+		return nil
 	})
 	if err != nil {
 		return Response{}, err
 	}
 	return resp, nil
 }
+
+// completeKey is db.CompleteKey's statement, queued rather than run (see Tx.deferExec).
+const completeKey = `UPDATE idempotency
+SET status = 'completed', response_code = $4, response_body = $5, completed_at = now(), lease_token = NULL, locked_until = NULL
+WHERE partner_id = $1 AND key = $2 AND lease_token = $3`
 
 // ReleaseKey frees a key after a failure whose outcome must not be stored, so a retry runs the request again. It
 // deletes only this attempt's own in-progress claim: if the failure was a lost COMMIT acknowledgement, the key is

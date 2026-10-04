@@ -2,7 +2,7 @@
 
 A double-entry ledger service in Go: accounts, idempotent transfers and holds, a transactional outbox to Kafka, and an inbox-based consumer, built so that money can't be created, lost or moved twice.
 
-> **Status:** the double-entry core, the Postgres schema, accounts, transfers, holds, idempotent writes and the event pipeline (outbox, relay, notifier) are built; security, observability and operations follow.
+> **Status:** complete: the double-entry core, accounts, transfers, holds, idempotent writes, the event pipeline, security, observability, reconciliation, the failure demo, the load test and the Kubernetes manifests.
 
 ## Toolchain
 
@@ -56,6 +56,7 @@ Each binary has an admin listener apart from its main port: `ledger-api` on `:90
 On SIGTERM, `ledger-api` fails readiness, keeps serving for `SHUTDOWN_DRAIN` (5 s), then stops accepting and lets in-flight requests finish. The relay stops within `SHUTDOWN_TIMEOUT` (15 s) even if Kafka is unreachable. Every write and every authentication failure is recorded in `audit_log`; each partner is rate-limited by its `rate_limit_per_min`.
 
 - [Decisions](docs/decisions.md)
+- [Runbook](docs/runbook.md)
 
 ## Licence
 
@@ -74,22 +75,24 @@ load/setup.sh && load/run.sh                                # RATE and HOLD over
 ```
 
 **Measured** on one laptop (Apple Silicon, Docker Desktop with 8 vCPUs and 4 GB for the whole stack: Postgres,
-Redpanda, the three services, the observability stack and k6 itself), 2026-10-05:
+Redpanda, the three services, the observability stack and k6 itself), 2026-10-05. Before and after the transfer
+fast path (one pipelined round trip while the row locks are held, instead of about ten), same profile, 2-minute runs,
+back to back:
 
-| | Result |
-|---|---|
-| Correctness | **0 errors** in 67,579 checked requests, **0 replay mismatches**, reconciliation clean |
-| Throughput | **166 iterations/s sustained** of the 200/s offered (k6 dropped the rest) |
-| Transfer latency (k6) | median 16 ms, **p99 5.4 s** |
-| Transfers within 100 ms (ledger-api's own histogram) | **64%** |
-| At 100/s for 60 s | p99 317 ms, nothing dropped |
+| | p50 | p95 | p99 | transfers within 100 ms (server) | sustained | dropped | errors |
+|---|---|---|---|---|---|---|---|
+| 100/s, before | 3 ms | 54 ms | 256 ms | 96.97% | 91/s | 0 | 0% |
+| 100/s, after | 3 ms | 27 ms | 229 ms | 97.73% | 91/s | 0 | 0% |
+| 200/s, before | 4 ms | 972 ms | 5,047 ms | 87.09% | 167/s | 1,666 | 0% |
+| 200/s, after | 3 ms | 67 ms | **258 ms** | **96.41%** | **181/s** | 16 | 0% |
 
-**SLO verdict: missed.** The target is 99% of `POST /v1/transfers` under 100 ms at 200/s; this machine sustains
-about 166/s and its tail is far above 100 ms even at 100/s. What the investigation found (details in
-[decisions](docs/decisions.md)):
+Every run: 0 errors, 0 replay mismatches, reconciliation clean. (A longer 5-minute run at 200/s before the fast path
+had p99 5.4 s.)
 
-- **The service isn't CPU-bound:** a CPU profile mid-run shows ledger-api using about half a core, mostly in network syscalls.
-- **Postgres's write-ahead log is the bottleneck:** sampled wait events are mostly `WALWrite` and `WalSync` (commits queueing for the log flush), then row-lock waits. Each transfer holds its two balance locks across about a dozen sequential round trips, so slow commits lengthen lock hold times and build convoys.
-- **Done:** the notifier now commits once per batch instead of once per event (p99 at 200/s fell from 8.4 s to 2.5 s in a 60 s run). Postgres group commit (`commit_delay`) was tried and made it worse: waiting to share a flush while holding row locks feeds the convoy.
-- **Next:** fewer round trips while the locks are held (pipelining a transfer's statements), and a real database disk rather than a laptop VM's.
+**SLO verdict: still missed**, though now near it. The target is 99% of `POST /v1/transfers` under 100 ms at 200/s.
+After the fast path, 96.4% are, and p99 is 258 ms. What's left:
+
+- **Postgres's write-ahead log was the bottleneck:** sampled wait events were mostly `WALWrite` and `WalSync` (commits queueing for the log flush), then row-lock waits. Each transfer held its two balance locks across about ten sequential round trips, so slow commits became lock convoys. The service itself isn't CPU-bound: a mid-run profile shows ledger-api using about half a core.
+- **Fixes, in order:** the notifier commits once per batch instead of once per event; a transfer is now one pipelined batch under its locks, with the funds check inside a conditional `UPDATE`, and the audit row and idempotency completion share one round trip before COMMIT. Postgres group commit (`commit_delay`) was tried and made it worse, so it was reverted. Durability was never traded: `synchronous_commit` stays on.
+- **What remains:** holds and captures (20% of the load) still take the round-trip-per-statement path on the same accounts, and every commit's WAL flush goes through Docker Desktop's VM disk. pgbench in the same container has p99 4.2 ms with rare spikes near 300 ms. A local NVMe disk or a managed Postgres, the same fast path for holds, and sharding hot settlement accounts are the next levers.
 
