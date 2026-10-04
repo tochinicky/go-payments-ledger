@@ -202,6 +202,20 @@ func TestPostingsAreAppendOnly(t *testing.T) {
 	}
 }
 
+// The app's connections carry the request bounds as session settings.
+func TestAppConnectionsCarryTheTimeouts(t *testing.T) {
+	want := map[string]string{"statement_timeout": "8s", "lock_timeout": "5s", "idle_in_transaction_session_timeout": "15s"}
+	for name, value := range want {
+		var got string
+		if err := tdb.App.QueryRow(context.Background(), "SELECT current_setting($1)", name).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != value {
+			t.Errorf("%s = %s, want %s", name, got, value)
+		}
+	}
+}
+
 // Invariant 3 in the database: a balance update that leaves available below the account's floor, and lower than it
 // was, fails, so a bug in the funds check would refuse the transfer instead of committing an overdraft.
 func TestBalanceBelowItsFloorCannotBeWritten(t *testing.T) {

@@ -5,7 +5,8 @@
 //
 // IDEMPOTENCY_RETENTION (a Go duration, default 24h) is how long completed idempotency keys are kept.
 // REQUEST_TIMEOUT, STATEMENT_TIMEOUT and LOCK_TIMEOUT (defaults 10s, 8s, 5s) bound each request; ledger-api refuses
-// to start unless idempotency lease (30s) > request > statement ≥ lock.
+// to start unless idempotency lease (30s) > request > statement ≥ lock. IDLE_IN_TRANSACTION_TIMEOUT (default 15s,
+// longer than a request) ends a session left idle inside a transaction.
 package main
 
 import (
@@ -57,6 +58,7 @@ func run(logger *slog.Logger, args []string) error {
 	timeouts := store.DefaultTimeouts
 	for name, d := range map[string]*time.Duration{
 		"REQUEST_TIMEOUT": &timeouts.Request, "STATEMENT_TIMEOUT": &timeouts.Statement, "LOCK_TIMEOUT": &timeouts.Lock,
+		"IDLE_IN_TRANSACTION_TIMEOUT": &timeouts.IdleInTransaction,
 	} {
 		if v := os.Getenv(name); v != "" {
 			if *d, err = time.ParseDuration(v); err != nil {
