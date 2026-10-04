@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/tochinicky/go-payments-ledger/internal/events"
 	"github.com/tochinicky/go-payments-ledger/internal/ledger"
 	"github.com/tochinicky/go-payments-ledger/internal/store/db"
 )
@@ -35,6 +36,15 @@ func toHold(h db.Hold) Hold {
 	}
 }
 
+// lockedHold is a locked hold row without its expiry check.
+func lockedHold(r db.LockHoldRow) Hold {
+	return toHold(db.Hold{
+		ID: r.ID, PartnerID: r.PartnerID, AccountID: r.AccountID, ToAccountID: r.ToAccountID, AmountMinor: r.AmountMinor,
+		Currency: r.Currency, Status: r.Status, ExpiresAt: r.ExpiresAt, CapturedMinor: r.CapturedMinor,
+		TransactionID: r.TransactionID, CreatedAt: r.CreatedAt, EndedAt: r.EndedAt,
+	})
+}
+
 // PlaceHold reserves amount on one of the partner's accounts for a destination fixed now, until expiresIn from now
 // (on the database clock). The checks are the Book's: both accounts the partner's, active, in the amount's currency,
 // and the source able to spend it.
@@ -59,15 +69,19 @@ func (tx Tx) PlaceHold(ctx context.Context, partnerID, accountID, toAccountID uu
 	if err := from.CanSpend(from.balance, amount.Amount); err != nil {
 		return Hold{}, err // CanSpend also shows posted − held − amount fits, so held + amount can't overflow
 	}
-	if _, err := tx.q.ApplyToBalance(ctx, db.ApplyToBalanceParams{AccountID: accountID, HeldDelta: amount.Amount}); err != nil {
-		return Hold{}, fmt.Errorf("reserve: %w", err)
-	}
+	holdID := tx.s.newID()
 	h, err := tx.q.InsertHold(ctx, db.InsertHoldParams{
-		ID: tx.s.newID(), PartnerID: partnerID, AccountID: accountID, ToAccountID: toAccountID,
+		ID: holdID, PartnerID: partnerID, AccountID: accountID, ToAccountID: toAccountID,
 		AmountMinor: amount.Amount, Currency: string(amount.Currency), ExpiresInSeconds: expiresIn.Seconds(),
 	})
 	if err != nil {
 		return Hold{}, fmt.Errorf("insert hold: %w", err)
+	}
+	if _, err := tx.apply(ctx, entry{
+		partnerID: partnerID, accountID: accountID, currency: amount.Currency, heldDelta: amount.Amount,
+		eventType: events.HoldPlaced, amount: -amount.Amount, holdID: &holdID,
+	}); err != nil {
+		return Hold{}, err
 	}
 	return toHold(h), nil
 }
@@ -125,7 +139,11 @@ func (tx Tx) CaptureHold(ctx context.Context, partnerID, holdID uuid.UUID, amoun
 	if _, err := tx.q.InsertTransaction(ctx, db.InsertTransactionParams{ID: txID, PartnerID: partnerID, Kind: string(ledger.KindHoldCapture)}); err != nil {
 		return Hold{}, fmt.Errorf("insert transaction: %w", err)
 	}
-	if err := tx.post(ctx, txID, postings, map[uuid.UUID]int64{h.AccountID: -h.AmountMinor}); err != nil {
+	kind := ledger.KindHoldCapture
+	entries := transferEntries(partnerID, txID, kind, postings)
+	// The source's entry releases the whole reservation and posts the captured part: one entry, one version.
+	entries[0].heldDelta, entries[0].eventType, entries[0].holdID = -h.AmountMinor, events.HoldCaptured, &h.ID
+	if err := tx.post(ctx, txID, postings, entries); err != nil {
 		return Hold{}, err
 	}
 	ended, err := tx.q.EndHold(ctx, db.EndHoldParams{ID: h.ID, Status: string(ledger.HoldCaptured), CapturedMinor: amount, TransactionID: &txID})
@@ -144,15 +162,22 @@ func (tx Tx) ReleaseHold(ctx context.Context, partnerID, holdID uuid.UUID) (Hold
 	if _, err := lockAccounts(ctx, tx.q, partnerID, h.AccountID); err != nil {
 		return Hold{}, err
 	}
-	return tx.endHold(ctx, h.ID, h.AccountID, h.AmountMinor, ledger.HoldReleased)
+	return tx.endHold(ctx, lockedHold(h), partnerID, ledger.HoldReleased)
 }
 
-// endHold gives back a hold's reservation (one version bump on its account) and marks the hold ended.
-func (tx Tx) endHold(ctx context.Context, holdID, accountID uuid.UUID, amount int64, status ledger.HoldStatus) (Hold, error) {
-	if _, err := tx.q.ApplyToBalance(ctx, db.ApplyToBalanceParams{AccountID: accountID, HeldDelta: -amount}); err != nil {
-		return Hold{}, fmt.Errorf("release reservation: %w", err)
+// endHold gives back a hold's reservation (one entry on its account, with its event) and marks the hold ended.
+func (tx Tx) endHold(ctx context.Context, h Hold, partnerID uuid.UUID, status ledger.HoldStatus) (Hold, error) {
+	eventType := events.HoldReleased
+	if status == ledger.HoldExpired {
+		eventType = events.HoldExpired
 	}
-	ended, err := tx.q.EndHold(ctx, db.EndHoldParams{ID: holdID, Status: string(status)})
+	if _, err := tx.apply(ctx, entry{
+		partnerID: partnerID, accountID: h.AccountID, currency: h.Amount.Currency, heldDelta: -h.Amount.Amount,
+		eventType: eventType, amount: h.Amount.Amount, holdID: &h.ID,
+	}); err != nil {
+		return Hold{}, err
+	}
+	ended, err := tx.q.EndHold(ctx, db.EndHoldParams{ID: h.ID, Status: string(status)})
 	if err != nil {
 		return Hold{}, fmt.Errorf("end hold: %w", err)
 	}
@@ -171,41 +196,55 @@ func (s *Store) Hold(ctx context.Context, partnerID, holdID uuid.UUID) (Hold, er
 	return toHold(h), nil
 }
 
-// ExpireHolds ends every active hold whose time is up, in batches of batchSize (one transaction each), and returns
-// how many it expired. Each batch locks its holds (skipping any a request holds right now), then their balances in
-// account-id order, like every other path: hold rows before balance rows, balances by id. Safe on several replicas.
+// ExpireHolds ends active holds whose time is up, each in its own short transaction, and returns how many it
+// expired. A hold that is locked (a request is ending it, or another replica is expiring it) or whose account is
+// locked (a transfer is running) is skipped and picked up on a later run, so the job never waits on a lock and
+// never holds more than one hold's locks. Safe on several replicas.
 func (s *Store) ExpireHolds(ctx context.Context, batchSize int32) (int, error) {
 	total := 0
 	for {
-		n := 0
-		err := s.inTx(ctx, func(tx Tx) error {
-			due, err := tx.q.DueHolds(ctx, batchSize)
-			if err != nil {
-				return fmt.Errorf("due holds: %w", err)
-			}
-			ids := make([]uuid.UUID, 0, len(due))
-			for _, h := range due {
-				ids = append(ids, h.AccountID)
-			}
-			if _, err := tx.q.LockBalances(ctx, ids); err != nil { // the query sorts: locks are taken in id order
-				return fmt.Errorf("lock balances: %w", err)
-			}
-			for _, h := range due {
-				if _, err := tx.endHold(ctx, h.ID, h.AccountID, h.AmountMinor, ledger.HoldExpired); err != nil {
-					return err
-				}
-			}
-			n = len(due)
-			return nil
-		})
+		due, err := db.New(s.pool).DueHolds(ctx, batchSize)
 		if err != nil {
-			return total, err
+			return total, fmt.Errorf("due holds: %w", err)
 		}
-		total += n
-		if n < int(batchSize) {
+		expired := 0
+		for _, id := range due {
+			ok, err := s.expireHold(ctx, id)
+			if err != nil {
+				return total, err
+			}
+			if ok {
+				expired++
+			}
+		}
+		total += expired
+		if len(due) < int(batchSize) || expired < len(due) { // done, or only busy holds are left for now
 			return total, nil
 		}
 	}
+}
+
+func (s *Store) expireHold(ctx context.Context, id uuid.UUID) (expired bool, err error) {
+	err = s.inTx(ctx, func(tx Tx) error {
+		h, err := tx.q.LockDueHold(ctx, id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil // already ended, no longer due, or someone else has it
+		}
+		if err != nil {
+			return fmt.Errorf("lock hold: %w", err)
+		}
+		if _, err := tx.q.LockBalanceNoWait(ctx, h.AccountID); errors.Is(err, pgx.ErrNoRows) {
+			return nil // the account is busy: next run
+		} else if err != nil {
+			return fmt.Errorf("lock balance: %w", err)
+		}
+		if _, err := tx.endHold(ctx, toHold(h), h.PartnerID, ledger.HoldExpired); err != nil {
+			return err
+		}
+		expired = true
+		return nil
+	})
+	return expired, err
 }
 
 // PlaceHold, CaptureHold and ReleaseHold in their own transactions, for callers without an idempotency key.

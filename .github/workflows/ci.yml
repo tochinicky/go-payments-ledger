@@ -26,8 +26,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      # The race detector on every run. The store and API tests start Postgres with Testcontainers;
-      # GitHub's Linux runners have Docker.
+      # The race detector on every run. The store, API and end-to-end tests start Postgres and Redpanda with
+      # Testcontainers; GitHub's Linux runners have Docker.
       - run: go test -race -count=1 ./...
 
   # The store-vs-Book property test at 1,000 random sequences (default runs use rapid's 100, to keep them quick).
@@ -48,3 +48,16 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go build -trimpath -ldflags "-X github.com/tochinicky/go-payments-ledger/internal/version.Commit=${GITHUB_SHA::7}" ./...
+      # Crash points exist only in -tags faultinject builds. Prove the production binaries have none: check the
+      # package path in the symbol table (function names can be inlined away; the package path can't hide).
+      - name: no fault injection in production binaries
+        run: |
+          mkdir -p bin
+          for cmd in ledger-api relay notifier; do
+            go build -trimpath -o bin/$cmd ./cmd/$cmd
+            if go tool nm bin/$cmd | grep -q 'internal/faultinject'; then
+              echo "bin/$cmd contains internal/faultinject"; exit 1
+            fi
+          done
+          go build -tags faultinject -o bin/relay-faultinject ./cmd/relay
+          go tool nm bin/relay-faultinject | grep -q 'internal/faultinject'   # the check can see it when it's there

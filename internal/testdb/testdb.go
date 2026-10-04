@@ -6,6 +6,7 @@ package testdb
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"testing"
 
@@ -20,8 +21,10 @@ const Image = "postgres:18-alpine"
 
 // DB is a migrated test database.
 type DB struct {
-	Owner *pgxpool.Pool // the owner role: creates partners, can read everything
-	App   *pgxpool.Pool // ledger_app, a login role in ledger_writer: what ledger-api connects as
+	Owner    *pgxpool.Pool // the owner role: creates partners, can read everything
+	App      *pgxpool.Pool // ledger_app, a login role in ledger_writer: what ledger-api connects as
+	OwnerDSN string
+	AppDSN   string
 }
 
 // Run starts Postgres, runs the package's tests and stops it: call it from TestMain. One container per test
@@ -66,16 +69,36 @@ func open(ctx context.Context, container *postgres.PostgresContainer) (*DB, erro
 	if _, err := owner.Exec(ctx, "CREATE ROLE ledger_app LOGIN PASSWORD 'app' IN ROLE ledger_writer"); err != nil {
 		return nil, fmt.Errorf("create app role: %w", err)
 	}
-	appCfg, err := pgxpool.ParseConfig(ownerDSN)
+	appDSN, err := withUser(ownerDSN, "ledger_app", "app")
 	if err != nil {
 		return nil, err
 	}
-	appCfg.ConnConfig.User, appCfg.ConnConfig.Password = "ledger_app", "app"
+	appCfg, err := pgxpool.ParseConfig(appDSN)
+	if err != nil {
+		return nil, err
+	}
 	appCfg.MaxConns = 20
 	store.DefaultTimeouts.Apply(appCfg) // the same bounds as production
 	app, err := pgxpool.NewWithConfig(ctx, appCfg)
 	if err != nil {
 		return nil, err
 	}
-	return &DB{Owner: owner, App: app}, nil
+	return &DB{Owner: owner, App: app, OwnerDSN: ownerDSN, AppDSN: appDSN}, nil
+}
+
+// LoginRole creates a login role in a group role (such as notifier_writer) and returns its connection string.
+func (d *DB) LoginRole(ctx context.Context, name, password, group string) (string, error) {
+	if _, err := d.Owner.Exec(ctx, fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD '%s' IN ROLE %s", name, password, group)); err != nil {
+		return "", fmt.Errorf("create role %s: %w", name, err)
+	}
+	return withUser(d.OwnerDSN, name, password)
+}
+
+func withUser(dsn, user, password string) (string, error) {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return "", err
+	}
+	u.User = url.UserPassword(user, password)
+	return u.String(), nil
 }

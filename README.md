@@ -2,7 +2,7 @@
 
 A double-entry ledger service in Go: accounts, idempotent transfers and holds, a transactional outbox to Kafka, and an inbox-based consumer, built so that money can't be created, lost or moved twice.
 
-> **Status:** the double-entry core, the Postgres schema, accounts, transfers, holds and idempotent writes are built; events and operations follow.
+> **Status:** the double-entry core, the Postgres schema, accounts, transfers, holds, idempotent writes and the event pipeline (outbox, relay, notifier) are built; security, observability and operations follow.
 
 ## Toolchain
 
@@ -36,6 +36,18 @@ Every write (`POST`) needs an `Idempotency-Key` header (at most 255 characters, 
 | `POST /v1/holds/{id}/release` | free the reservation (empty body or `{}`) |
 
 `ledger-api migrate` applies the migrations (owner role); `ledger-api` serves on `LISTEN_ADDR` (default `:8080`). Both read `DATABASE_URL`.
+
+## Events
+
+Every change to an account's balance writes one event to an outbox table in the same database transaction. `relay` publishes the outbox to Kafka (topic `ledger.account-entries.v1`, 6 partitions, keyed by account id); run several for availability, and one leads. `notifier` is a sample consumer that records one notification per event, exactly once.
+
+```sh
+KAFKA_BROKERS=localhost:9092 relay create-topic                 # once: the topic, with its fixed partition count
+DATABASE_URL=... KAFKA_BROKERS=localhost:9092 relay
+DATABASE_URL=... KAFKA_BROKERS=localhost:9092 notifier          # the notifier's own database role
+```
+
+The end-to-end tests (`internal/e2e`) run the pipeline against real Postgres and Redpanda containers, including crash and outage scenarios.
 
 - [Decisions](docs/decisions.md)
 

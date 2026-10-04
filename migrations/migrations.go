@@ -9,4 +9,4 @@ import "embed"
 var FS embed.FS
 
 // Version is the latest migration. The API reports ready only once the database has reached it, so traffic never hits a schema the code does not expect.
-const Version = 3
+const Version = 5

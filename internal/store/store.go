@@ -5,6 +5,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/tochinicky/go-payments-ledger/internal/events"
 	"github.com/tochinicky/go-payments-ledger/internal/ledger"
 	"github.com/tochinicky/go-payments-ledger/internal/store/db"
 )
@@ -237,7 +239,7 @@ func (tx Tx) Transfer(ctx context.Context, partnerID, fromID, toID uuid.UUID, am
 		return Transfer{}, fmt.Errorf("insert transaction: %w", err)
 	}
 	t.CreatedAt = created.Time
-	if err := tx.post(ctx, t.ID, postings, nil); err != nil {
+	if err := tx.post(ctx, t.ID, postings, transferEntries(partnerID, t.ID, ledger.KindTransfer, postings)); err != nil {
 		return Transfer{}, err
 	}
 	return t, nil
@@ -286,23 +288,81 @@ func checkPosted(postings []ledger.Posting, locked map[uuid.UUID]lockedAccount) 
 	return nil
 }
 
-// post applies a transaction's postings to the (locked) balances and writes them. Each posting records the balance
-// version it produced as its account_seq. heldDelta, if any, changes an account's held balance in the same update
-// (a capture releases its reservation as part of the same entry).
-func (tx Tx) post(ctx context.Context, txID uuid.UUID, postings []ledger.Posting, heldDelta map[uuid.UUID]int64) error {
-	for _, p := range postings {
-		balance, err := tx.q.ApplyToBalance(ctx, db.ApplyToBalanceParams{AccountID: p.AccountID, PostedDelta: p.Amount.Amount, HeldDelta: heldDelta[p.AccountID]})
+// entry is one ledger operation's change to one account: what to apply to its balance, and what its event says.
+type entry struct {
+	partnerID, accountID uuid.UUID
+	currency             ledger.Currency
+	postedDelta          int64
+	heldDelta            int64
+	eventType            string
+	amount               int64 // the event's amount_minor (see events.Event)
+	txID                 *uuid.UUID
+	txKind               *ledger.TransactionKind
+	holdID               *uuid.UUID
+}
+
+// apply makes one account entry: it updates the (locked) balance, bumping its version once, and then, in the same
+// transaction and still under the account's lock, writes the entry's outbox event. That order is what makes the
+// outbox seq follow each account's commit order (invariant 6). Every change to a balance goes through here.
+func (tx Tx) apply(ctx context.Context, e entry) (db.ApplyToBalanceRow, error) {
+	b, err := tx.q.ApplyToBalance(ctx, db.ApplyToBalanceParams{AccountID: e.accountID, PostedDelta: e.postedDelta, HeldDelta: e.heldDelta})
+	if err != nil {
+		return db.ApplyToBalanceRow{}, fmt.Errorf("update balance: %w", err)
+	}
+	var kind *string
+	if e.txKind != nil {
+		k := string(*e.txKind)
+		kind = &k
+	}
+	id := tx.s.newID()
+	payload, err := json.Marshal(events.Event{
+		EventID: id, EventType: e.eventType, SchemaVersion: events.SchemaVersion, PartnerID: e.partnerID, AccountID: e.accountID,
+		TransactionID: e.txID, TransactionKind: kind, HoldID: e.holdID, AmountMinor: e.amount, Currency: string(e.currency),
+		PostedBalanceAfter: b.PostedMinor, HeldBalanceAfter: b.HeldMinor, AccountSeq: b.Version,
+	})
+	if err != nil {
+		return db.ApplyToBalanceRow{}, fmt.Errorf("event payload: %w", err)
+	}
+	if err := tx.q.InsertOutbox(ctx, db.InsertOutboxParams{
+		ID: id, PartnerID: e.partnerID, AccountID: e.accountID, AccountSeq: b.Version, EventType: e.eventType, Payload: payload,
+	}); err != nil {
+		return db.ApplyToBalanceRow{}, fmt.Errorf("insert outbox: %w", err)
+	}
+	return b, nil
+}
+
+// post writes a transaction's postings: for each, the account entry (balance and event), then the posting with the
+// version that entry produced as its account_seq. entries[i] is postings[i]'s entry.
+func (tx Tx) post(ctx context.Context, txID uuid.UUID, postings []ledger.Posting, entries []entry) error {
+	for i, p := range postings {
+		b, err := tx.apply(ctx, entries[i])
 		if err != nil {
-			return fmt.Errorf("update balance: %w", err)
+			return err
 		}
 		if err := tx.q.InsertPosting(ctx, db.InsertPostingParams{
 			ID: tx.s.newID(), TransactionID: txID, AccountID: p.AccountID, AmountMinor: p.Amount.Amount,
-			Currency: string(p.Amount.Currency), AccountSeq: balance.Version,
+			Currency: string(p.Amount.Currency), AccountSeq: b.Version,
 		}); err != nil {
 			return fmt.Errorf("insert posting: %w", err)
 		}
 	}
 	return nil
+}
+
+// transferEntries are the plain debit and credit entries of a transaction's postings.
+func transferEntries(partnerID, txID uuid.UUID, kind ledger.TransactionKind, postings []ledger.Posting) []entry {
+	entries := make([]entry, len(postings))
+	for i, p := range postings {
+		eventType := events.AccountCredited
+		if p.Amount.Amount < 0 {
+			eventType = events.AccountDebited
+		}
+		entries[i] = entry{
+			partnerID: partnerID, accountID: p.AccountID, currency: p.Amount.Currency, postedDelta: p.Amount.Amount,
+			eventType: eventType, amount: p.Amount.Amount, txID: &txID, txKind: &kind,
+		}
+	}
+	return entries
 }
 
 // Statement returns up to limit entries of one of the partner's accounts with account_seq above afterSeq, in

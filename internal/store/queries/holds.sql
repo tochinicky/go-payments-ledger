@@ -20,17 +20,18 @@ WHERE id = $1
 RETURNING *;
 
 -- name: DueHolds :many
--- A batch of active holds whose time is up. SKIP LOCKED: replicas share the work, and a hold someone is capturing
--- or releasing right now is left to them.
-SELECT * FROM holds
+-- A batch of holds whose time is up. No lock here: each is then expired in its own short transaction.
+SELECT id FROM holds
 WHERE status = 'active' AND expires_at <= now()
 ORDER BY expires_at
-LIMIT sqlc.arg(batch_size)
-FOR UPDATE SKIP LOCKED;
+LIMIT sqlc.arg(batch_size);
 
--- name: LockBalances :many
--- Locks balance rows in account-id order (for the expiry job, whose holds span partners).
-SELECT account_id, posted_minor, held_minor, version FROM balances
-WHERE account_id = ANY(sqlc.arg(ids)::uuid[])
-ORDER BY account_id
-FOR UPDATE;
+-- name: LockDueHold :one
+-- Locks a hold for expiry, re-checking it is still active and due. SKIP LOCKED: a hold a request (or another
+-- replica) is ending right now is left to it.
+SELECT * FROM holds WHERE id = $1 AND status = 'active' AND expires_at <= now() FOR UPDATE SKIP LOCKED;
+
+-- name: LockBalanceNoWait :one
+-- The expiry job never waits for a busy account: if a transfer holds the balance row, the hold is expired on the
+-- next run instead (no client can capture it meanwhile, since it is past its time).
+SELECT account_id FROM balances WHERE account_id = $1 FOR UPDATE SKIP LOCKED;

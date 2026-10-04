@@ -13,41 +13,26 @@ import (
 )
 
 const dueHolds = `-- name: DueHolds :many
-SELECT id, partner_id, account_id, to_account_id, amount_minor, currency, status, expires_at, captured_minor, transaction_id, created_at, ended_at FROM holds
+SELECT id FROM holds
 WHERE status = 'active' AND expires_at <= now()
 ORDER BY expires_at
 LIMIT $1
-FOR UPDATE SKIP LOCKED
 `
 
-// A batch of active holds whose time is up. SKIP LOCKED: replicas share the work, and a hold someone is capturing
-// or releasing right now is left to them.
-func (q *Queries) DueHolds(ctx context.Context, batchSize int32) ([]Hold, error) {
+// A batch of holds whose time is up. No lock here: each is then expired in its own short transaction.
+func (q *Queries) DueHolds(ctx context.Context, batchSize int32) ([]uuid.UUID, error) {
 	rows, err := q.db.Query(ctx, dueHolds, batchSize)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []Hold
+	var items []uuid.UUID
 	for rows.Next() {
-		var i Hold
-		if err := rows.Scan(
-			&i.ID,
-			&i.PartnerID,
-			&i.AccountID,
-			&i.ToAccountID,
-			&i.AmountMinor,
-			&i.Currency,
-			&i.Status,
-			&i.ExpiresAt,
-			&i.CapturedMinor,
-			&i.TransactionID,
-			&i.CreatedAt,
-			&i.EndedAt,
-		); err != nil {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
 			return nil, err
 		}
-		items = append(items, i)
+		items = append(items, id)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -168,37 +153,43 @@ func (q *Queries) InsertHold(ctx context.Context, arg InsertHoldParams) (Hold, e
 	return i, err
 }
 
-const lockBalances = `-- name: LockBalances :many
-SELECT account_id, posted_minor, held_minor, version FROM balances
-WHERE account_id = ANY($1::uuid[])
-ORDER BY account_id
-FOR UPDATE
+const lockBalanceNoWait = `-- name: LockBalanceNoWait :one
+SELECT account_id FROM balances WHERE account_id = $1 FOR UPDATE SKIP LOCKED
 `
 
-// Locks balance rows in account-id order (for the expiry job, whose holds span partners).
-func (q *Queries) LockBalances(ctx context.Context, ids []uuid.UUID) ([]Balance, error) {
-	rows, err := q.db.Query(ctx, lockBalances, ids)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []Balance
-	for rows.Next() {
-		var i Balance
-		if err := rows.Scan(
-			&i.AccountID,
-			&i.PostedMinor,
-			&i.HeldMinor,
-			&i.Version,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
+// The expiry job never waits for a busy account: if a transfer holds the balance row, the hold is expired on the
+// next run instead (no client can capture it meanwhile, since it is past its time).
+func (q *Queries) LockBalanceNoWait(ctx context.Context, accountID uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockBalanceNoWait, accountID)
+	var account_id uuid.UUID
+	err := row.Scan(&account_id)
+	return account_id, err
+}
+
+const lockDueHold = `-- name: LockDueHold :one
+SELECT id, partner_id, account_id, to_account_id, amount_minor, currency, status, expires_at, captured_minor, transaction_id, created_at, ended_at FROM holds WHERE id = $1 AND status = 'active' AND expires_at <= now() FOR UPDATE SKIP LOCKED
+`
+
+// Locks a hold for expiry, re-checking it is still active and due. SKIP LOCKED: a hold a request (or another
+// replica) is ending right now is left to it.
+func (q *Queries) LockDueHold(ctx context.Context, id uuid.UUID) (Hold, error) {
+	row := q.db.QueryRow(ctx, lockDueHold, id)
+	var i Hold
+	err := row.Scan(
+		&i.ID,
+		&i.PartnerID,
+		&i.AccountID,
+		&i.ToAccountID,
+		&i.AmountMinor,
+		&i.Currency,
+		&i.Status,
+		&i.ExpiresAt,
+		&i.CapturedMinor,
+		&i.TransactionID,
+		&i.CreatedAt,
+		&i.EndedAt,
+	)
+	return i, err
 }
 
 const lockHold = `-- name: LockHold :one
