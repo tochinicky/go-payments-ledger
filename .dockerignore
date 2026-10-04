@@ -1,0 +1,7 @@
+# Allow-list: the image is built only from the Go sources and migrations.
+*
+!go.mod
+!go.sum
+!cmd
+!internal
+!migrations

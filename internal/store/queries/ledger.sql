@@ -61,3 +61,12 @@ FROM postings p JOIN transactions t ON t.id = p.transaction_id
 WHERE p.account_id = sqlc.arg(account_id) AND p.account_seq > sqlc.arg(after_seq)
 ORDER BY p.account_seq
 LIMIT sqlc.arg(page_size);
+
+-- name: RotatePartnerKey :execrows
+UPDATE partners SET api_key_hash = $2 WHERE id = $1;
+
+-- name: OutboxStatus :one
+SELECT count(*) AS total,
+       count(*) FILTER (WHERE published_at IS NULL) AS unpublished,
+       coalesce(extract(epoch FROM now() - min(created_at) FILTER (WHERE published_at IS NULL)), 0)::float8 AS oldest_unpublished_seconds
+FROM outbox;

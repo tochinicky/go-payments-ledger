@@ -1,0 +1,125 @@
+# The whole system on one machine: docker compose up --build, then scripts/demo.sh.
+#   API          http://localhost:8080      (ledger-api; admin/metrics on :9090)
+#   Jaeger       http://localhost:16686     (traces)
+#   Prometheus   http://localhost:9095      (metrics)
+# ledger-api reaches Postgres through Toxiproxy (localhost:8474), so the demo can cut its connections.
+name: go-payments-ledger
+
+x-ledger: &ledger
+  build: .
+  image: go-payments-ledger:dev
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: owner
+      POSTGRES_PASSWORD: owner
+      POSTGRES_DB: ledger
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "owner", "-d", "ledger"]
+      interval: 2s
+      retries: 30
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.2.3
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=1G
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+    volumes: ["./deploy/compose/redpanda-bootstrap.yaml:/etc/redpanda/.bootstrap.yaml:ro"]
+    ports: ["19092:19092"]
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 2s
+      retries: 60
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    command: ["-host=0.0.0.0", "-config=/config/toxiproxy.json"]
+    volumes: ["./deploy/compose/toxiproxy.json:/config/toxiproxy.json:ro"]
+    ports: ["8474:8474"]
+    depends_on: [postgres]
+
+  migrate:
+    <<: *ledger
+    restart: "no"
+    command: ["migrate"]
+    environment:
+      DATABASE_URL: postgres://owner:owner@postgres:5432/ledger?sslmode=disable
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  setup:
+    image: postgres:18-alpine
+    restart: "no"
+    command: ["psql", "-v", "ON_ERROR_STOP=1", "-f", "/setup.sql", "postgres://owner:owner@postgres:5432/ledger?sslmode=disable"]
+    volumes: ["./deploy/compose/setup.sql:/setup.sql:ro"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+
+  topic:
+    <<: *ledger
+    restart: "no"
+    entrypoint: ["/usr/local/bin/relay", "create-topic"]
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    depends_on:
+      redpanda: {condition: service_healthy}
+
+  ledger-api:
+    <<: *ledger
+    environment:
+      DATABASE_URL: postgres://ledger_app:ledger_app@toxiproxy:15432/ledger?sslmode=disable
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      SHUTDOWN_DRAIN: 1s
+    ports: ["8080:8080", "9090:9090"]
+    depends_on:
+      setup: {condition: service_completed_successfully}
+      toxiproxy: {condition: service_started}
+
+  relay:
+    <<: *ledger
+    entrypoint: ["/usr/local/bin/relay"]
+    environment:
+      DATABASE_URL: postgres://ledger_app:ledger_app@postgres:5432/ledger?sslmode=disable
+      KAFKA_BROKERS: redpanda:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    ports: ["9091:9091"]
+    depends_on:
+      setup: {condition: service_completed_successfully}
+      topic: {condition: service_completed_successfully}
+
+  notifier:
+    <<: *ledger
+    entrypoint: ["/usr/local/bin/notifier"]
+    environment:
+      DATABASE_URL: postgres://notifier_app:notifier_app@postgres:5432/ledger?sslmode=disable
+      KAFKA_BROKERS: redpanda:9092
+      SESSION_TIMEOUT: 6s
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    ports: ["9092:9092"]
+    depends_on:
+      setup: {condition: service_completed_successfully}
+      topic: {condition: service_completed_successfully}
+
+  otel-collector:
+    image: otel/opentelemetry-collector:0.162.0
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes: ["./deploy/compose/otel-collector.yaml:/etc/otel/config.yaml:ro"]
+    depends_on: [jaeger]
+
+  jaeger:
+    image: jaegertracing/jaeger:2.21.0
+    ports: ["16686:16686"]
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    volumes: ["./deploy/compose/prometheus.yaml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9095:9090"]

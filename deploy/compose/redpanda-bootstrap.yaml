@@ -1,0 +1,2 @@
+# Cluster properties applied when the cluster is first created.
+auto_create_topics_enabled: false   # the topic is created explicitly, with its fixed partition count

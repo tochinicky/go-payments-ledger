@@ -61,3 +61,12 @@ jobs:
           done
           go build -tags faultinject -o bin/relay-faultinject ./cmd/relay
           go tool nm bin/relay-faultinject | grep -q 'internal/faultinject'   # the check can see it when it's there
+
+  # The container image: built (never pushed), so a broken Dockerfile fails CI.
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --build-arg COMMIT=${GITHUB_SHA::7} -t go-payments-ledger:ci .
+      - run: docker run --rm --entrypoint /usr/local/bin/ledgerctl go-payments-ledger:ci 2>&1 | grep -q usage
+

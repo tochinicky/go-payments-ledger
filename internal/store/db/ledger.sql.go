@@ -266,6 +266,26 @@ func (q *Queries) LockAccounts(ctx context.Context, arg LockAccountsParams) ([]L
 	return items, nil
 }
 
+const outboxStatus = `-- name: OutboxStatus :one
+SELECT count(*) AS total,
+       count(*) FILTER (WHERE published_at IS NULL) AS unpublished,
+       coalesce(extract(epoch FROM now() - min(created_at) FILTER (WHERE published_at IS NULL)), 0)::float8 AS oldest_unpublished_seconds
+FROM outbox
+`
+
+type OutboxStatusRow struct {
+	Total                    int64
+	Unpublished              int64
+	OldestUnpublishedSeconds float64
+}
+
+func (q *Queries) OutboxStatus(ctx context.Context) (OutboxStatusRow, error) {
+	row := q.db.QueryRow(ctx, outboxStatus)
+	var i OutboxStatusRow
+	err := row.Scan(&i.Total, &i.Unpublished, &i.OldestUnpublishedSeconds)
+	return i, err
+}
+
 const partnerByKeyHash = `-- name: PartnerByKeyHash :one
 SELECT id, name, api_key_hash, rate_limit_per_min, funding_limit_minor FROM partners WHERE api_key_hash = $1
 `
@@ -289,6 +309,23 @@ func (q *Queries) PartnerByKeyHash(ctx context.Context, apiKeyHash []byte) (Part
 		&i.FundingLimitMinor,
 	)
 	return i, err
+}
+
+const rotatePartnerKey = `-- name: RotatePartnerKey :execrows
+UPDATE partners SET api_key_hash = $2 WHERE id = $1
+`
+
+type RotatePartnerKeyParams struct {
+	ID         uuid.UUID
+	ApiKeyHash []byte
+}
+
+func (q *Queries) RotatePartnerKey(ctx context.Context, arg RotatePartnerKeyParams) (int64, error) {
+	result, err := q.db.Exec(ctx, rotatePartnerKey, arg.ID, arg.ApiKeyHash)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const statement = `-- name: Statement :many
