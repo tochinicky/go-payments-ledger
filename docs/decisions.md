@@ -168,3 +168,14 @@ The decisions the build depends on, each with its reason:
   - **Scenario 3:** with the broker stopped (5 s in the test; the demo uses 60 s), transfers keep succeeding and the outbox grows; after it restarts, everything is delivered in order with no gaps.
   - **Scenario 4:** the notifier process crashes after its database commit, before the offset commit, partway through the stream. A new member gets the uncommitted batch again and skips exactly that many duplicates, records the rest, and there is one notification per event.
 
+## Slice 6: security, observability and operations
+
+**Security**
+- **Every write attempt and every authentication failure gets an audit row** (`audit_log`: partner, actor, route, path, status, request id, time). A write that ran is audited inside its own transaction, so the money movement (or its stored refusal) and its audit row commit together; anything else (a validation error, a replay, a 409, a 429, a 5xx) is audited right after the answer. Reads aren't audited.
+- **The audit log is append-only like the ledger:** the app role has INSERT and SELECT only, and the same triggers refuse UPDATE, DELETE and TRUNCATE even for the owner.
+- **No secrets in logs or audit rows.** An unknown API key is recorded only as `key:` plus the first 4 bytes of its SHA-256 in hex, enough to tell repeated attempts apart and useless for recovering the key. The Authorization header is never logged.
+- **Request ids:** a client's `X-Request-Id` is kept if it is short and plain (`[A-Za-z0-9._-]{1,64}`), otherwise replaced with a UUID, and echoed in the response. It ties a client's report to the logs and the audit log, and can't inject anything into either.
+- **Per-partner token-bucket rate limiting**, from `partners.rate_limit_per_min`: it refills at limit/60 per second, with a burst of ten seconds' worth. When the bucket is empty: `429 rate_limited` with `Retry-After`. It is per process, so with N replicas a partner gets up to N times its limit; an exact multi-replica limit needs a shared store (Redis) or the gateway in front. A refused write is still audited.
+- **Amounts are capped**: `amount_minor` must be at most `MAX_AMOUNT_MINOR` (default 10,000,000,000 minor units, 100 million euros), so a typo or an attack can't move an absurd sum in one request.
+- **Tenant isolation (scenario 7):** a test walks every route with another partner's key on partner A's accounts and holds: all answer 404, exactly as for an id that doesn't exist, and nothing of A's changes.
+

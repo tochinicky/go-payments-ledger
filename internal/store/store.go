@@ -50,9 +50,10 @@ func (s *Store) inTx(ctx context.Context, fn func(Tx) error) error {
 
 // Partner is a partner as the API sees it.
 type Partner struct {
-	ID           uuid.UUID
-	Name         string
-	FundingLimit int64
+	ID              uuid.UUID
+	Name            string
+	FundingLimit    int64
+	RateLimitPerMin int
 }
 
 // AccountView is an account with its balance, read in one query.
@@ -120,7 +121,7 @@ func (s *Store) PartnerByKeyHash(ctx context.Context, hash []byte) (p Partner, o
 	if err != nil {
 		return Partner{}, false, fmt.Errorf("partner by key: %w", err)
 	}
-	return Partner{ID: row.ID, Name: row.Name, FundingLimit: row.FundingLimitMinor}, true, nil
+	return Partner{ID: row.ID, Name: row.Name, FundingLimit: row.FundingLimitMinor, RateLimitPerMin: int(row.RateLimitPerMin)}, true, nil
 }
 
 // OpenCustomerAccount opens a customer account (floor 0) for a partner, in its own transaction.

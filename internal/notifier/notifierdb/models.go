@@ -20,6 +20,17 @@ type Account struct {
 	CreatedAt       pgtype.Timestamptz
 }
 
+type AuditLog struct {
+	ID        uuid.UUID
+	PartnerID *uuid.UUID
+	Actor     string
+	Action    string
+	Resource  string
+	Status    int32
+	RequestID string
+	At        pgtype.Timestamptz
+}
+
 type Balance struct {
 	AccountID   uuid.UUID
 	PostedMinor int64

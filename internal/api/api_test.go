@@ -28,7 +28,7 @@ var (
 
 func TestMain(m *testing.M) {
 	os.Exit(testdb.Run(m, &tdb, func() {
-		srv = httptest.NewServer(api.New(store.New(tdb.App, store.NewID), slog.New(slog.DiscardHandler), store.DefaultTimeouts.Request).Handler())
+		srv = httptest.NewServer(api.New(api.Config{Store: store.New(tdb.App, store.NewID), Log: slog.New(slog.DiscardHandler), RequestTimeout: store.DefaultTimeouts.Request}).Handler())
 	}))
 }
 
@@ -36,6 +36,7 @@ func TestMain(m *testing.M) {
 type client struct {
 	t          *testing.T
 	key        string
+	partner    uuid.UUID
 	settlement uuid.UUID
 }
 
@@ -52,7 +53,7 @@ func newClient(t *testing.T, fundingLimit int64) client {
 	if err := tdb.Owner.QueryRow(ctx, "SELECT id FROM accounts WHERE partner_id = $1 AND kind = 'settlement'", p.ID).Scan(&settlement); err != nil {
 		t.Fatal(err)
 	}
-	return client{t: t, key: key, settlement: settlement}
+	return client{t: t, key: key, partner: p.ID, settlement: settlement}
 }
 
 // do sends a request and decodes the JSON answer into a map. Writes get a fresh Idempotency-Key.

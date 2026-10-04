@@ -39,7 +39,7 @@ func TestRelayFailover(t *testing.T) {
 	ctx := context.Background()
 	startRelay(t)
 	startRelay(t)
-	startNotifier(t)
+	n := startNotifier(t)
 	p := newPartner(t, 4)
 	leader := func() int {
 		var pid int
@@ -64,6 +64,11 @@ func TestRelayFailover(t *testing.T) {
 	eventually(t, 10*time.Second, "no standby took over", func() bool { l := leader(); return l != 0 && l != first })
 	p.waitDelivered(t, 60*time.Second)
 	p.checkDelivery(t)
+	// A failover can re-send rows the old leader was still publishing, so an older account_seq may arrive after a
+	// newer one. The inbox check comes first, so a re-sent event is a duplicate, never a regression or a gap.
+	if s := n.Stats(); s.Regressions != 0 || s.Gaps != 0 {
+		t.Errorf("notifier stats %+v: duplicates from the failover were counted as regressions or gaps", s)
+	}
 }
 
 // Fairness: one hot account under sustained load mustn't delay everyone else. The relay publishes in seq order,

@@ -48,6 +48,7 @@ var statusOf = map[string]int{
 	"insufficient_funds":       http.StatusUnprocessableEntity,
 	"currency_mismatch":        http.StatusUnprocessableEntity,
 	"same_account":             http.StatusUnprocessableEntity,
+	"rate_limited":             http.StatusTooManyRequests,
 	"unavailable":              http.StatusServiceUnavailable,
 }
 

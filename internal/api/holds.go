@@ -57,8 +57,8 @@ func (s *Server) placeHold(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		bad = append(bad, fieldError{"to_account", "must be an account id"})
 	}
-	if req.AmountMinor == nil || *req.AmountMinor <= 0 {
-		bad = append(bad, fieldError{"amount_minor", "must be a positive integer number of minor units"})
+	if !s.validAmount(req.AmountMinor) {
+		bad = append(bad, s.amountError())
 	}
 	currency, err := ledger.ParseCurrency(req.Currency)
 	if err != nil {
@@ -116,9 +116,9 @@ func (s *Server) captureHold(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	if req.AmountMinor == nil || *req.AmountMinor <= 0 {
+	if !s.validAmount(req.AmountMinor) {
 		writeProblem(w, "validation_failed", "the request has invalid fields",
-			fieldError{"amount_minor", "must be a positive integer number of minor units"})
+			s.amountError())
 		return
 	}
 	canonical := struct {

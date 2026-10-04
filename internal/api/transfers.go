@@ -33,8 +33,8 @@ func (s *Server) createTransfer(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		bad = append(bad, fieldError{"to", "must be an account id"})
 	}
-	if req.AmountMinor == nil || *req.AmountMinor <= 0 {
-		bad = append(bad, fieldError{"amount_minor", "must be a positive integer number of minor units"})
+	if !s.validAmount(req.AmountMinor) {
+		bad = append(bad, s.amountError())
 	}
 	currency, err := ledger.ParseCurrency(req.Currency)
 	if err != nil {

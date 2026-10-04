@@ -55,14 +55,15 @@ func (s *Server) idempotent(w http.ResponseWriter, r *http.Request, request any,
 	}
 
 	resp, err := s.store.RunWithLease(r.Context(), claim.Lease, func(tx store.Tx) (store.Response, error) {
-		status, body, err := run(r.Context(), tx)
+		resp, err := response(run(r.Context(), tx))
 		if err != nil {
-			if status, problemBody, ok := businessError(err); ok {
-				return store.Response{Status: status, Body: problemBody}, nil
-			}
 			return store.Response{}, err
 		}
-		return store.Response{Status: status, Body: mustJSON(body)}, nil
+		// The audit row commits with the write (or its stored refusal), in the same transaction.
+		if err := tx.Audit(r.Context(), auditEntry(r, resp.Status)); err != nil {
+			return store.Response{}, err
+		}
+		return resp, nil
 	})
 	switch {
 	case errors.Is(err, store.ErrLeaseLost):
@@ -71,8 +72,21 @@ func (s *Server) idempotent(w http.ResponseWriter, r *http.Request, request any,
 		s.release(r, claim.Lease)
 		s.writeError(w, r, err)
 	default:
+		markAudited(r)
 		writeBody(w, resp.Status, resp.Body)
 	}
+}
+
+// response renders a write's outcome for storing: its success body, or a business refusal as problem+json.
+// Any other error isn't a final outcome and is passed on.
+func response(status int, body any, err error) (store.Response, error) {
+	if err != nil {
+		if status, problemBody, ok := businessError(err); ok {
+			return store.Response{Status: status, Body: problemBody}, nil
+		}
+		return store.Response{}, err
+	}
+	return store.Response{Status: status, Body: mustJSON(body)}, nil
 }
 
 // release frees a failed attempt's key so a retry can run, on a fresh context: the request's own may be what

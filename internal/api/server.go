@@ -4,6 +4,7 @@ package api
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,19 +22,39 @@ import (
 // maxBodyBytes caps a request body. Every request this API takes is a few hundred bytes.
 const maxBodyBytes = 64 << 10
 
+// DefaultMaxAmountMinor caps a single amount: 10 billion in minor units (100 million euros), far above any real
+// transfer here, so a typo or an attack can't move absurd sums in one request.
+const DefaultMaxAmountMinor = 10_000_000_000
+
+// Config configures the API.
+type Config struct {
+	Store          *store.Store
+	Log            *slog.Logger
+	RequestTimeout time.Duration // every request's deadline (store.Timeouts.Request)
+	MaxAmountMinor int64         // the largest amount_minor accepted (default DefaultMaxAmountMinor)
+}
+
 // Server serves the API from a store.
 type Server struct {
 	store          *store.Store
 	log            *slog.Logger
 	requestTimeout time.Duration
+	maxAmount      int64
+	limiters       *limiters
 }
 
-// New returns a server. requestTimeout is every request's deadline (store.Timeouts.Request).
-func New(st *store.Store, log *slog.Logger, requestTimeout time.Duration) *Server {
-	return &Server{store: st, log: log, requestTimeout: requestTimeout}
+// New returns a server.
+func New(cfg Config) *Server {
+	if cfg.MaxAmountMinor == 0 {
+		cfg.MaxAmountMinor = DefaultMaxAmountMinor
+	}
+	return &Server{
+		store: cfg.Store, log: cfg.Log, requestTimeout: cfg.RequestTimeout, maxAmount: cfg.MaxAmountMinor, limiters: newLimiters(),
+	}
 }
 
-// Handler returns the routes, every one behind authentication.
+// Handler returns the routes. Every request gets a request id and a deadline, then must authenticate (failures are
+// audited); every write is audited with its outcome, including a refusal by the per-partner rate limit.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/accounts", s.openAccount)
@@ -45,7 +66,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/holds/{id}", s.getHold)
 	mux.HandleFunc("POST /v1/holds/{id}/capture", s.captureHold)
 	mux.HandleFunc("POST /v1/holds/{id}/release", s.releaseHold)
-	return s.withDeadline(s.authenticate(mux))
+	return withRequestID(s.withDeadline(s.authenticate(s.auditWrites(mux, s.rateLimit(mux)))))
 }
 
 // withDeadline gives each request a context deadline. pgx cancels a query when its context ends, so a request stuck
@@ -62,11 +83,13 @@ type partnerKey struct{}
 
 // authenticate resolves "Authorization: Bearer <key>" to a partner, by the SHA-256 of the key. Keys are random and
 // high-entropy, so a fast hash is enough (bcrypt exists to slow down guessing low-entropy passwords). The lookup is
-// by hash in an index, so request timing can reveal nothing about the key itself.
+// by hash in an index, so request timing can reveal nothing about the key itself. Every failure is audited, with
+// at most a short fingerprint of the key's hash: never the key.
 func (s *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		key, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if !ok || key == "" {
+			s.auditFailure(r, "anonymous")
 			writeProblem(w, "unauthenticated", "an API key is required: Authorization: Bearer <key>")
 			return
 		}
@@ -77,6 +100,7 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			return
 		}
 		if !found {
+			s.auditFailure(r, "key:"+hex.EncodeToString(hash[:4]))
 			writeProblem(w, "unauthenticated", "unknown API key")
 			return
 		}
@@ -129,4 +153,13 @@ func pathID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
 		return uuid.Nil, false
 	}
 	return id, true
+}
+
+// validAmount reports whether an amount_minor was given, is positive and is within the configured maximum.
+func (s *Server) validAmount(a *int64) bool {
+	return a != nil && *a > 0 && *a <= s.maxAmount
+}
+
+func (s *Server) amountError() fieldError {
+	return fieldError{"amount_minor", fmt.Sprintf("a positive integer number of minor units, at most %d", s.maxAmount)}
 }
