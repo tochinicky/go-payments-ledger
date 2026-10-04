@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -380,10 +381,12 @@ func TestConcurrentTransfersConserveMoney(t *testing.T) {
 	}
 }
 
-// TestStoreAgreesWithTheBook runs random transfers against both the database and the in-memory Book (slice 1's
-// reference model): every command must get the same outcome from both, and every balance must match after each step.
+// TestStoreAgreesWithTheBook runs random transfers, holds, captures and releases against both the database and the
+// in-memory Book (slice 1's reference model): every command must get the same outcome from both, and every balance
+// must match after each step. (Holds here never reach their expiry; the expiry job has its own tests.)
 func TestStoreAgreesWithTheBook(t *testing.T) {
 	ctx := context.Background()
+	farFuture := time.Now().Add(24 * time.Hour)
 	rapid.Check(t, func(rt *rapid.T) {
 		limit := rapid.Int64Range(0, 10_000).Draw(rt, "funding limit")
 		f := newFixture(t, limit)
@@ -403,13 +406,37 @@ func TestStoreAgreesWithTheBook(t *testing.T) {
 			toBook[id] = a.ID
 			dbIDs = append(dbIDs, id)
 		}
-		for i := range rapid.IntRange(1, 20).Draw(rt, "steps") {
-			from := rapid.SampledFrom(dbIDs).Draw(rt, "from")
-			to := rapid.SampledFrom(dbIDs).Draw(rt, "to")
-			amount := ledger.Money{Amount: rapid.Int64Range(0, 5_000).Draw(rt, "amount"), Currency: eur}
-
-			_, dbErr := f.store.Transfer(ctx, f.partner.ID, from, to, amount, nil)
-			_, bookErr := book.Transfer(f.partner.ID, toBook[from], toBook[to], amount)
+		holdToBook := map[uuid.UUID]uuid.UUID{}
+		var holds []uuid.UUID
+		amount := func(label string) ledger.Money {
+			return ledger.Money{Amount: rapid.Int64Range(0, 5_000).Draw(rt, label), Currency: eur}
+		}
+		for i := range rapid.IntRange(1, 25).Draw(rt, "steps") {
+			var dbErr, bookErr error
+			switch op := rapid.IntRange(0, 3).Draw(rt, "op"); {
+			case op == 0 || len(holds) == 0 && op >= 2:
+				from, to, m := rapid.SampledFrom(dbIDs).Draw(rt, "from"), rapid.SampledFrom(dbIDs).Draw(rt, "to"), amount("amount")
+				_, dbErr = f.store.Transfer(ctx, f.partner.ID, from, to, m, nil)
+				_, bookErr = book.Transfer(f.partner.ID, toBook[from], toBook[to], m)
+			case op == 1:
+				from, to, m := rapid.SampledFrom(dbIDs).Draw(rt, "from"), rapid.SampledFrom(dbIDs).Draw(rt, "to"), amount("hold")
+				var dbHold store.Hold
+				var bookHold ledger.Hold
+				dbHold, dbErr = f.store.PlaceHold(ctx, f.partner.ID, from, to, m, 24*time.Hour)
+				bookHold, bookErr = book.PlaceHold(f.partner.ID, toBook[from], toBook[to], m, farFuture)
+				if dbErr == nil && bookErr == nil {
+					holdToBook[dbHold.ID] = bookHold.ID
+					holds = append(holds, dbHold.ID)
+				}
+			case op == 2:
+				h, n := rapid.SampledFrom(holds).Draw(rt, "capture"), rapid.Int64Range(0, 5_000).Draw(rt, "captured")
+				_, dbErr = f.store.CaptureHold(ctx, f.partner.ID, h, n)
+				_, _, bookErr = book.CaptureHold(f.partner.ID, holdToBook[h], n)
+			default:
+				h := rapid.SampledFrom(holds).Draw(rt, "release")
+				_, dbErr = f.store.ReleaseHold(ctx, f.partner.ID, h)
+				_, bookErr = book.ReleaseHold(f.partner.ID, holdToBook[h])
+			}
 			if (dbErr == nil) != (bookErr == nil) || (dbErr != nil && dbErr.Error() != bookErr.Error()) {
 				rt.Fatalf("step %d: store says %v, book says %v", i, dbErr, bookErr)
 			}

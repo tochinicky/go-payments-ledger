@@ -237,7 +237,7 @@ func (tx Tx) Transfer(ctx context.Context, partnerID, fromID, toID uuid.UUID, am
 		return Transfer{}, fmt.Errorf("insert transaction: %w", err)
 	}
 	t.CreatedAt = created.Time
-	if err := tx.post(ctx, t.ID, postings); err != nil {
+	if err := tx.post(ctx, t.ID, postings, nil); err != nil {
 		return Transfer{}, err
 	}
 	return t, nil
@@ -287,10 +287,11 @@ func checkPosted(postings []ledger.Posting, locked map[uuid.UUID]lockedAccount) 
 }
 
 // post applies a transaction's postings to the (locked) balances and writes them. Each posting records the balance
-// version it produced as its account_seq.
-func (tx Tx) post(ctx context.Context, txID uuid.UUID, postings []ledger.Posting) error {
+// version it produced as its account_seq. heldDelta, if any, changes an account's held balance in the same update
+// (a capture releases its reservation as part of the same entry).
+func (tx Tx) post(ctx context.Context, txID uuid.UUID, postings []ledger.Posting, heldDelta map[uuid.UUID]int64) error {
 	for _, p := range postings {
-		balance, err := tx.q.AddToPosted(ctx, db.AddToPostedParams{AccountID: p.AccountID, Delta: p.Amount.Amount})
+		balance, err := tx.q.ApplyToBalance(ctx, db.ApplyToBalanceParams{AccountID: p.AccountID, PostedDelta: p.Amount.Amount, HeldDelta: heldDelta[p.AccountID]})
 		if err != nil {
 			return fmt.Errorf("update balance: %w", err)
 		}

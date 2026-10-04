@@ -41,6 +41,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/accounts/{id}/balance", s.getBalance)
 	mux.HandleFunc("GET /v1/accounts/{id}/statement", s.getStatement)
 	mux.HandleFunc("POST /v1/transfers", s.createTransfer)
+	mux.HandleFunc("POST /v1/holds", s.placeHold)
+	mux.HandleFunc("GET /v1/holds/{id}", s.getHold)
+	mux.HandleFunc("POST /v1/holds/{id}/capture", s.captureHold)
+	mux.HandleFunc("POST /v1/holds/{id}/release", s.releaseHold)
 	return s.withDeadline(s.authenticate(mux))
 }
 
@@ -87,9 +91,21 @@ func partnerOf(r *http.Request) store.Partner {
 // decode reads a JSON body strictly: one object, no unknown fields, at most maxBodyBytes. A typo in a field name
 // is refused rather than silently ignored. It writes the error response itself and reports whether to go on.
 func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
+	return decodeBody(w, r, dst, false)
+}
+
+// decodeOptional is decode for requests whose body may be empty (no fields to send), such as a release.
+func decodeOptional(w http.ResponseWriter, r *http.Request, dst any) bool {
+	return decodeBody(w, r, dst, true)
+}
+
+func decodeBody(w http.ResponseWriter, r *http.Request, dst any, emptyOK bool) bool {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	dec.DisallowUnknownFields()
 	err := dec.Decode(dst)
+	if emptyOK && errors.Is(err, io.EOF) {
+		return true
+	}
 	if err == nil && !errors.Is(dec.Decode(&struct{}{}), io.EOF) {
 		err = errors.New("unexpected data after the JSON object")
 	}
@@ -109,7 +125,7 @@ func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
 func pathID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
 	id, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
-		writeProblem(w, "not_found", "no such account")
+		writeProblem(w, "not_found", "not found")
 		return uuid.Nil, false
 	}
 	return id, true

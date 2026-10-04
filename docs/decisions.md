@@ -125,3 +125,21 @@ The decisions the build depends on, each with its reason:
   - **Lock timeout:** a request behind a held balance lock gets a 503 after about 5 s, its key is freed, and once the lock is gone a retry with the same key succeeds (one transaction). The timeout ordering is unit-tested.
   - **Retry storm (scenario 1):** 50 identical requests with one key, with the settlement row held locked so the first request is really in flight. Result: exactly one 201 and 49 409s with `Retry-After`, a final retry gets the identical 201, and exactly one transaction.
 
+## Slice 4: holds and expiry
+
+- **A hold reserves money by raising `held`; it posts nothing until it's captured.** Placing a hold runs the same checks as a transfer (both accounts the partner's, active, the amount's currency, enough available), on the same ordered locks.
+- **A capture is one entry on the source account:** it releases the whole reservation and posts the captured part in a single balance update, so the version goes up once (`ApplyToBalance` changes posted and held together). A partial capture releases the remainder. No funds check is needed, and `available` can only go up.
+- **A hold past its `expires_at` is no longer active, even before the job has ended it.** An expired authorisation can't be captured or released (`409 hold_not_active`); the expiry job then gives the reservation back. The in-memory Book has no clock in capture, so the property test keeps its holds far from expiry, and expiry has its own tests.
+- **Expiry runs in ledger-api every 5 s**, in batches of 100, each one transaction: `FOR UPDATE SKIP LOCKED` on due holds (replicas share the work, and a hold a request is ending right now is left to it), then the balances in account-id order.
+- **Lock order everywhere: hold row first, then balance rows in account-id order.** Placing a hold takes only balance rows (the hold is new); capture, release and expiry take the hold row, then balances. The expiry job never waits on a hold row (SKIP LOCKED), and balances are always taken in the same order, so there's no cycle.
+- **Invariant 4 in the database:** a trigger refuses any change to a hold that has already ended, even by the owner, and CHECK constraints tie the status to its fields (`captured` ⇔ a transaction and captured > 0; `active` ⇔ no end time; captured ≤ amount). The app role may update only the four columns that end a hold.
+- **`expires_in` is 1 s to 30 days**, and `expires_at` is computed on the database clock, like the idempotency lease.
+- **Capture and release answer 200** (the hold changed state; a capture's transaction is its `transaction_id`); placing answers 201. All three take an Idempotency-Key. Release accepts an empty body.
+- **Tests:**
+  - **Rules:** placing reserves without posting; a partial capture posts the part and releases the rest; the refusals (insufficient funds, exceeds the hold, inactive destination leaves the hold active, another partner's hold is 404, twice is `hold_not_active`); release; a hold past its time can't be captured or released.
+  - **Statement and versions agree:** placing a hold takes version 2 with no posting, and the capture's posting carries account_seq 3.
+  - **Expiry:** only due holds end, across batches of 2; a capture racing the job, 20 times: exactly one ends each hold, and money is conserved.
+  - **Database:** an ended hold can't be revived.
+  - **Property:** the store-vs-Book test now draws transfers, holds, captures and releases (1,000 sequences in its CI job).
+  - **API:** place, capture and release end to end, the error catalogue for holds, and an idempotent capture that posts once.
+

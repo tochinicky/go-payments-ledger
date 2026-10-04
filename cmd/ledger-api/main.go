@@ -83,6 +83,7 @@ func run(logger *slog.Logger, args []string) error {
 	}
 	st := store.New(pool, store.NewID)
 	go cleanupKeys(ctx, logger, st, retention)
+	go expireHolds(ctx, logger, st)
 
 	addr := os.Getenv("LISTEN_ADDR")
 	if addr == "" {
@@ -130,6 +131,29 @@ func cleanupKeys(ctx context.Context, logger *slog.Logger, st *store.Store, rete
 		}
 		if n > 0 {
 			logger.InfoContext(ctx, "idempotency keys cleaned up", slog.Int64("deleted", n))
+		}
+	}
+}
+
+// expireHolds ends due holds every few seconds until ctx ends, so a hold is released at most a few seconds after
+// its time (and no client can capture it meanwhile: a hold past its time is no longer active). Every replica runs
+// it; SKIP LOCKED batches share the work.
+func expireHolds(ctx context.Context, logger *slog.Logger, st *store.Store) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		n, err := st.ExpireHolds(ctx, 100)
+		if err != nil {
+			logger.WarnContext(ctx, "hold expiry failed", slog.Any("error", err))
+			continue
+		}
+		if n > 0 {
+			logger.InfoContext(ctx, "holds expired", slog.Int("expired", n))
 		}
 	}
 }

@@ -41,6 +41,9 @@ var statusOf = map[string]int{
 	"account_not_active":       http.StatusConflict,
 	"account_not_empty":        http.StatusConflict,
 	"account_not_closable":     http.StatusConflict,
+	"hold_not_active":          http.StatusConflict,
+	"hold_not_capturable":      http.StatusConflict,
+	"capture_exceeds_hold":     http.StatusUnprocessableEntity,
 	"idempotency_key_reused":   http.StatusUnprocessableEntity,
 	"insufficient_funds":       http.StatusUnprocessableEntity,
 	"currency_mismatch":        http.StatusUnprocessableEntity,
@@ -109,8 +112,9 @@ func unavailable(err error) bool {
 	return errors.As(err, &netErr) || errors.As(err, &connectErr) || pgconn.Timeout(err) || errors.Is(err, context.DeadlineExceeded)
 }
 
-func writeJSON(w http.ResponseWriter, status int, body any) {
-	writeBody(w, status, mustJSON(body))
+// writeOK answers a read with 200 and a JSON body. (Writes answer through idempotent, which stores the response.)
+func writeOK(w http.ResponseWriter, body any) {
+	writeBody(w, http.StatusOK, mustJSON(body))
 }
 
 // writeBody sends a rendered JSON body: problem+json for errors.

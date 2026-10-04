@@ -31,8 +31,11 @@ WHERE a.id = ANY(sqlc.arg(ids)::uuid[]) AND a.partner_id = sqlc.arg(partner_id)
 ORDER BY a.id
 FOR UPDATE OF b;
 
--- name: AddToPosted :one
-UPDATE balances SET posted_minor = posted_minor + sqlc.arg(delta), version = version + 1
+-- name: ApplyToBalance :one
+-- One ledger operation's change to one account: posted and held move together, and the version goes up by exactly
+-- one (a capture both releases the reservation and posts, as a single entry).
+UPDATE balances
+SET posted_minor = posted_minor + sqlc.arg(posted_delta), held_minor = held_minor + sqlc.arg(held_delta), version = version + 1
 WHERE account_id = $1
 RETURNING posted_minor, held_minor, version;
 

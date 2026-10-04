@@ -58,26 +58,30 @@ func (q *Queries) AccountWithBalance(ctx context.Context, arg AccountWithBalance
 	return i, err
 }
 
-const addToPosted = `-- name: AddToPosted :one
-UPDATE balances SET posted_minor = posted_minor + $2, version = version + 1
+const applyToBalance = `-- name: ApplyToBalance :one
+UPDATE balances
+SET posted_minor = posted_minor + $2, held_minor = held_minor + $3, version = version + 1
 WHERE account_id = $1
 RETURNING posted_minor, held_minor, version
 `
 
-type AddToPostedParams struct {
-	AccountID uuid.UUID
-	Delta     int64
+type ApplyToBalanceParams struct {
+	AccountID   uuid.UUID
+	PostedDelta int64
+	HeldDelta   int64
 }
 
-type AddToPostedRow struct {
+type ApplyToBalanceRow struct {
 	PostedMinor int64
 	HeldMinor   int64
 	Version     int64
 }
 
-func (q *Queries) AddToPosted(ctx context.Context, arg AddToPostedParams) (AddToPostedRow, error) {
-	row := q.db.QueryRow(ctx, addToPosted, arg.AccountID, arg.Delta)
-	var i AddToPostedRow
+// One ledger operation's change to one account: posted and held move together, and the version goes up by exactly
+// one (a capture both releases the reservation and posts, as a single entry).
+func (q *Queries) ApplyToBalance(ctx context.Context, arg ApplyToBalanceParams) (ApplyToBalanceRow, error) {
+	row := q.db.QueryRow(ctx, applyToBalance, arg.AccountID, arg.PostedDelta, arg.HeldDelta)
+	var i ApplyToBalanceRow
 	err := row.Scan(&i.PostedMinor, &i.HeldMinor, &i.Version)
 	return i, err
 }

@@ -77,7 +77,7 @@ func (s *Server) getAccount(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, toAccountJSON(a))
+	writeOK(w, toAccountJSON(a))
 }
 
 // GET /v1/accounts/{id}/balance
@@ -96,7 +96,7 @@ func (s *Server) getBalance(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, fmt.Errorf("account %s: available overflows", a.ID))
 		return
 	}
-	writeJSON(w, http.StatusOK, struct {
+	writeOK(w, struct {
 		AccountID      uuid.UUID `json:"account_id"`
 		Currency       string    `json:"currency"`
 		PostedMinor    int64     `json:"posted_minor"`
@@ -163,7 +163,7 @@ func (s *Server) getStatement(w http.ResponseWriter, r *http.Request) {
 			e.PostingID, e.TransactionID, e.AccountSeq, string(e.Kind), e.Reference, e.Amount.Amount, string(e.Amount.Currency), e.CreatedAt.UTC(),
 		})
 	}
-	writeJSON(w, http.StatusOK, body)
+	writeOK(w, body)
 }
 
 // A cursor is the account_seq of the last entry on the previous page, base64url-encoded so clients treat it as

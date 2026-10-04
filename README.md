@@ -2,7 +2,7 @@
 
 A double-entry ledger service in Go: accounts, idempotent transfers and holds, a transactional outbox to Kafka, and an inbox-based consumer, built so that money can't be created, lost or moved twice.
 
-> **Status:** the double-entry core, the Postgres schema, the accounts and transfers API and idempotent writes are built; holds, events and operations follow.
+> **Status:** the double-entry core, the Postgres schema, accounts, transfers, holds and idempotent writes are built; events and operations follow.
 
 ## Toolchain
 
@@ -30,6 +30,10 @@ Every write (`POST`) needs an `Idempotency-Key` header (at most 255 characters, 
 | `GET /v1/accounts/{id}/balance` | posted, held and available, in minor units |
 | `GET /v1/accounts/{id}/statement?cursor=&limit=` | entries oldest first, keyset-paginated |
 | `POST /v1/transfers` `{from, to, amount_minor, currency, reference?}` | move money between two of the partner's accounts |
+| `POST /v1/holds` `{account, to_account, amount_minor, currency, expires_in}` | reserve money for a destination fixed now (`expires_in` in seconds, up to 30 days) |
+| `GET /v1/holds/{id}` | the hold |
+| `POST /v1/holds/{id}/capture` `{amount_minor}` | move up to the held amount to the destination; the rest is released |
+| `POST /v1/holds/{id}/release` | free the reservation (empty body or `{}`) |
 
 `ledger-api migrate` applies the migrations (owner role); `ledger-api` serves on `LISTEN_ADDR` (default `:8080`). Both read `DATABASE_URL`.
 

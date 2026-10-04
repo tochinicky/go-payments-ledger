@@ -27,6 +27,21 @@ type Balance struct {
 	Version     int64
 }
 
+type Hold struct {
+	ID            uuid.UUID
+	PartnerID     uuid.UUID
+	AccountID     uuid.UUID
+	ToAccountID   uuid.UUID
+	AmountMinor   int64
+	Currency      string
+	Status        string
+	ExpiresAt     pgtype.Timestamptz
+	CapturedMinor int64
+	TransactionID *uuid.UUID
+	CreatedAt     pgtype.Timestamptz
+	EndedAt       pgtype.Timestamptz
+}
+
 type Idempotency struct {
 	PartnerID    uuid.UUID
 	Key          string
