@@ -2,6 +2,8 @@
 //
 //	ledger-api           serve on LISTEN_ADDR (default :8080), connecting with DATABASE_URL as the app role
 //	ledger-api migrate   apply the migrations, connecting with DATABASE_URL as the owner role
+//
+// IDEMPOTENCY_RETENTION (a Go duration, default 24h) is how long completed idempotency keys are kept.
 package main
 
 import (
@@ -46,13 +48,22 @@ func run(logger *slog.Logger, args []string) error {
 	if len(args) > 0 && args[0] == "migrate" {
 		return store.Migrate(ctx, pool)
 	}
+	retention := 24 * time.Hour
+	if v := os.Getenv("IDEMPOTENCY_RETENTION"); v != "" {
+		if retention, err = time.ParseDuration(v); err != nil || retention <= 0 {
+			return fmt.Errorf("IDEMPOTENCY_RETENTION %q: a positive duration such as 24h", v)
+		}
+	}
+	st := store.New(pool, store.NewID)
+	go cleanupKeys(ctx, logger, st, retention)
+
 	addr := os.Getenv("LISTEN_ADDR")
 	if addr == "" {
 		addr = ":8080"
 	}
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           api.New(store.New(pool, store.NewID), logger).Handler(),
+		Handler:           api.New(st, logger).Handler(),
 		ReadHeaderTimeout: 5 * time.Second, // a client can't hold a connection open by sending headers slowly
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -72,4 +83,26 @@ func run(logger *slog.Logger, args []string) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	return srv.Shutdown(shutdownCtx)
+}
+
+// cleanupKeys deletes expired idempotency keys once a minute until ctx ends. Every replica runs it; the batches
+// skip rows another replica is deleting, so they share the work instead of waiting on each other.
+func cleanupKeys(ctx context.Context, logger *slog.Logger, st *store.Store, retention time.Duration) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		n, err := st.CleanupKeys(ctx, retention, 1000)
+		if err != nil {
+			logger.WarnContext(ctx, "idempotency key cleanup failed", slog.Any("error", err))
+			continue
+		}
+		if n > 0 {
+			logger.InfoContext(ctx, "idempotency keys cleaned up", slog.Int64("deleted", n))
+		}
+	}
 }

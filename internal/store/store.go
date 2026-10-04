@@ -33,6 +33,19 @@ func NewID() uuid.UUID {
 	return uuid.Must(uuid.NewV7())
 }
 
+// Tx is the ledger inside one database transaction: its operations commit or roll back together, with whatever
+// else the transaction does (such as completing an idempotency key).
+type Tx struct {
+	s *Store
+	q *db.Queries
+}
+
+func (s *Store) inTx(ctx context.Context, fn func(Tx) error) error {
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		return fn(Tx{s: s, q: db.New(tx)})
+	})
+}
+
 // Partner is a partner as the API sees it.
 type Partner struct {
 	ID           uuid.UUID
@@ -108,20 +121,25 @@ func (s *Store) PartnerByKeyHash(ctx context.Context, hash []byte) (p Partner, o
 	return Partner{ID: row.ID, Name: row.Name, FundingLimit: row.FundingLimitMinor}, true, nil
 }
 
-// OpenCustomerAccount opens a customer account (floor 0) for a partner. Settlement accounts are created only with
-// their partner.
+// OpenCustomerAccount opens a customer account (floor 0) for a partner, in its own transaction.
 func (s *Store) OpenCustomerAccount(ctx context.Context, partnerID uuid.UUID, currency ledger.Currency, customerRef *string) (AccountView, error) {
 	var view AccountView
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		q := db.New(tx)
-		id, err := s.openAccount(ctx, q, partnerID, ledger.KindCustomer, currency, 0, customerRef)
-		if err != nil {
-			return err
-		}
-		view, err = accountView(ctx, q, partnerID, id)
+	err := s.inTx(ctx, func(tx Tx) error {
+		var err error
+		view, err = tx.OpenCustomerAccount(ctx, partnerID, currency, customerRef)
 		return err
 	})
 	return view, err
+}
+
+// OpenCustomerAccount opens a customer account (floor 0) for a partner. Settlement accounts are created only with
+// their partner.
+func (tx Tx) OpenCustomerAccount(ctx context.Context, partnerID uuid.UUID, currency ledger.Currency, customerRef *string) (AccountView, error) {
+	id, err := tx.s.openAccount(ctx, tx.q, partnerID, ledger.KindCustomer, currency, 0, customerRef)
+	if err != nil {
+		return AccountView{}, err
+	}
+	return accountView(ctx, tx.q, partnerID, id)
 }
 
 func (s *Store) openAccount(ctx context.Context, q *db.Queries, partnerID uuid.UUID, kind ledger.AccountKind, currency ledger.Currency, minBalance int64, customerRef *string) (uuid.UUID, error) {
@@ -165,10 +183,22 @@ func accountView(ctx context.Context, q *db.Queries, partnerID, accountID uuid.U
 	}, nil
 }
 
+// Transfer moves amount between two of the partner's accounts, in its own transaction.
+func (s *Store) Transfer(ctx context.Context, partnerID, fromID, toID uuid.UUID, amount ledger.Money, reference *string) (Transfer, error) {
+	var t Transfer
+	err := s.inTx(ctx, func(tx Tx) error {
+		var err error
+		t, err = tx.Transfer(ctx, partnerID, fromID, toID, amount, reference)
+		return err
+	})
+	return t, err
+}
+
 // Transfer moves amount between two of the partner's accounts. The checks are the in-memory Book's, in the same
 // order, made against balance rows locked for the rest of the transaction, so no concurrent transfer can spend
-// the same money between the check and the write.
-func (s *Store) Transfer(ctx context.Context, partnerID, fromID, toID uuid.UUID, amount ledger.Money, reference *string) (Transfer, error) {
+// the same money between the check and the write. A business refusal (a *ledger.Error) is returned before anything
+// is written, so the transaction stays usable: the caller can still record the refusal and commit.
+func (tx Tx) Transfer(ctx context.Context, partnerID, fromID, toID uuid.UUID, amount ledger.Money, reference *string) (Transfer, error) {
 	if !amount.IsPositive() {
 		return Transfer{}, ledger.ErrInvalidAmount
 	}
@@ -182,33 +212,32 @@ func (s *Store) Transfer(ctx context.Context, partnerID, fromID, toID uuid.UUID,
 	if err := ledger.ValidatePostings(postings); err != nil {
 		return Transfer{}, err
 	}
-	t := Transfer{ID: s.newID(), From: fromID, To: toID, Amount: amount, Reference: reference}
-	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		q := db.New(tx)
-		locked, err := lockAccounts(ctx, q, partnerID, fromID, toID)
-		if err != nil {
-			return err
-		}
-		from, to := locked[fromID], locked[toID]
-		if from.Currency != amount.Currency || to.Currency != amount.Currency {
-			return ledger.ErrCurrencyMismatch
-		}
-		if from.Status != ledger.StatusActive || to.Status != ledger.StatusActive {
-			return ledger.ErrAccountNotActive
-		}
-		if err := from.CanSpend(from.balance, amount.Amount); err != nil {
-			return err
-		}
-		created, err := q.InsertTransaction(ctx, db.InsertTransactionParams{
-			ID: t.ID, PartnerID: partnerID, Kind: string(ledger.KindTransfer), Reference: reference,
-		})
-		if err != nil {
-			return fmt.Errorf("insert transaction: %w", err)
-		}
-		t.CreatedAt = created.Time
-		return s.post(ctx, q, t.ID, postings, locked)
+	locked, err := lockAccounts(ctx, tx.q, partnerID, fromID, toID)
+	if err != nil {
+		return Transfer{}, err
+	}
+	from, to := locked[fromID], locked[toID]
+	if from.Currency != amount.Currency || to.Currency != amount.Currency {
+		return Transfer{}, ledger.ErrCurrencyMismatch
+	}
+	if from.Status != ledger.StatusActive || to.Status != ledger.StatusActive {
+		return Transfer{}, ledger.ErrAccountNotActive
+	}
+	if err := from.CanSpend(from.balance, amount.Amount); err != nil {
+		return Transfer{}, err
+	}
+	if err := checkPosted(postings, locked); err != nil {
+		return Transfer{}, err
+	}
+	t := Transfer{ID: tx.s.newID(), From: fromID, To: toID, Amount: amount, Reference: reference}
+	created, err := tx.q.InsertTransaction(ctx, db.InsertTransactionParams{
+		ID: t.ID, PartnerID: partnerID, Kind: string(ledger.KindTransfer), Reference: reference,
 	})
 	if err != nil {
+		return Transfer{}, fmt.Errorf("insert transaction: %w", err)
+	}
+	t.CreatedAt = created.Time
+	if err := tx.post(ctx, t.ID, postings); err != nil {
 		return Transfer{}, err
 	}
 	return t, nil
@@ -245,23 +274,28 @@ func lockAccounts(ctx context.Context, q *db.Queries, partnerID uuid.UUID, ids .
 	return locked, nil
 }
 
-// post applies a transaction's postings to the locked balances and writes them. Every new balance is computed with
-// checked arithmetic first, so an overflow writes nothing. Each posting records the balance version it produced as
-// its account_seq.
-func (s *Store) post(ctx context.Context, q *db.Queries, txID uuid.UUID, postings []ledger.Posting, locked map[uuid.UUID]lockedAccount) error {
+// checkPosted computes every new posted balance with checked arithmetic, so an overflow is refused before anything
+// is written.
+func checkPosted(postings []ledger.Posting, locked map[uuid.UUID]lockedAccount) error {
 	for _, p := range postings {
 		posted := ledger.Money{Amount: locked[p.AccountID].balance.Posted, Currency: p.Amount.Currency}
 		if _, err := posted.Add(p.Amount); err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+// post applies a transaction's postings to the (locked) balances and writes them. Each posting records the balance
+// version it produced as its account_seq.
+func (tx Tx) post(ctx context.Context, txID uuid.UUID, postings []ledger.Posting) error {
 	for _, p := range postings {
-		balance, err := q.AddToPosted(ctx, db.AddToPostedParams{AccountID: p.AccountID, Delta: p.Amount.Amount})
+		balance, err := tx.q.AddToPosted(ctx, db.AddToPostedParams{AccountID: p.AccountID, Delta: p.Amount.Amount})
 		if err != nil {
 			return fmt.Errorf("update balance: %w", err)
 		}
-		if err := q.InsertPosting(ctx, db.InsertPostingParams{
-			ID: s.newID(), TransactionID: txID, AccountID: p.AccountID, AmountMinor: p.Amount.Amount,
+		if err := tx.q.InsertPosting(ctx, db.InsertPostingParams{
+			ID: tx.s.newID(), TransactionID: txID, AccountID: p.AccountID, AmountMinor: p.Amount.Amount,
 			Currency: string(p.Amount.Currency), AccountSeq: balance.Version,
 		}); err != nil {
 			return fmt.Errorf("insert posting: %w", err)

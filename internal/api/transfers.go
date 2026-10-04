@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"time"
 	"unicode/utf8"
@@ -8,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/tochinicky/go-payments-ledger/internal/ledger"
+	"github.com/tochinicky/go-payments-ledger/internal/store"
 )
 
 // POST /v1/transfers moves money between two of the caller's accounts.
@@ -46,18 +48,26 @@ func (s *Server) createTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	amount := ledger.Money{Amount: *req.AmountMinor, Currency: currency}
-	t, err := s.store.Transfer(r.Context(), partnerOf(r).ID, from, to, amount, req.Reference)
-	if err != nil {
-		s.writeError(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, struct {
-		ID          uuid.UUID `json:"id"`
-		From        uuid.UUID `json:"from"`
-		To          uuid.UUID `json:"to"`
-		AmountMinor int64     `json:"amount_minor"`
-		Currency    string    `json:"currency"`
-		Reference   *string   `json:"reference"`
-		CreatedAt   time.Time `json:"created_at"`
-	}{t.ID, t.From, t.To, t.Amount.Amount, string(t.Amount.Currency), t.Reference, t.CreatedAt.UTC()})
+	canonical := struct {
+		From        uuid.UUID       `json:"from"`
+		To          uuid.UUID       `json:"to"`
+		AmountMinor int64           `json:"amount_minor"`
+		Currency    ledger.Currency `json:"currency"`
+		Reference   *string         `json:"reference"`
+	}{from, to, amount.Amount, currency, req.Reference}
+	s.idempotent(w, r, canonical, func(ctx context.Context, tx store.Tx) (int, any, error) {
+		t, err := tx.Transfer(ctx, partnerOf(r).ID, from, to, amount, req.Reference)
+		if err != nil {
+			return 0, nil, err
+		}
+		return http.StatusCreated, struct {
+			ID          uuid.UUID `json:"id"`
+			From        uuid.UUID `json:"from"`
+			To          uuid.UUID `json:"to"`
+			AmountMinor int64     `json:"amount_minor"`
+			Currency    string    `json:"currency"`
+			Reference   *string   `json:"reference"`
+			CreatedAt   time.Time `json:"created_at"`
+		}{t.ID, t.From, t.To, t.Amount.Amount, string(t.Amount.Currency), t.Reference, t.CreatedAt.UTC()}, nil
+	})
 }

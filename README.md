@@ -2,7 +2,7 @@
 
 A double-entry ledger service in Go: accounts, idempotent transfers and holds, a transactional outbox to Kafka, and an inbox-based consumer, built so that money can't be created, lost or moved twice.
 
-> **Status:** the double-entry core, the Postgres schema and the accounts and transfers API are built; idempotency, holds, events and operations follow.
+> **Status:** the double-entry core, the Postgres schema, the accounts and transfers API and idempotent writes are built; holds, events and operations follow.
 
 ## Toolchain
 
@@ -20,6 +20,8 @@ The store and API tests start a throwaway Postgres with Testcontainers, so Docke
 ## API
 
 All routes need `Authorization: Bearer <partner API key>`; errors are `application/problem+json` with a stable `code`.
+
+Every write (`POST`) needs an `Idempotency-Key` header (at most 255 characters, scoped to the partner). A retry with the same key and request gets the original response, byte for byte, with `Idempotent-Replayed: true`. The same key with a different request gets `422 idempotency_key_reused`. While the first attempt is still running, a retry gets `409 idempotency_in_progress` with `Retry-After: 1`. Completed keys are kept for 24 hours (`IDEMPOTENCY_RETENTION`).
 
 | Route | |
 |---|---|

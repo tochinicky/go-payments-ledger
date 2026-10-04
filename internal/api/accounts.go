@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"net/http"
@@ -52,13 +53,17 @@ func (s *Server) openAccount(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, "validation_failed", "the request has invalid fields", bad...)
 		return
 	}
-	a, err := s.store.OpenCustomerAccount(r.Context(), partnerOf(r).ID, currency, req.CustomerRef)
-	if err != nil {
-		s.writeError(w, r, err)
-		return
-	}
-	w.Header().Set("Location", "/v1/accounts/"+a.ID.String())
-	writeJSON(w, http.StatusCreated, toAccountJSON(a))
+	canonical := struct {
+		Currency    ledger.Currency `json:"currency"`
+		CustomerRef *string         `json:"customer_ref"`
+	}{currency, req.CustomerRef}
+	s.idempotent(w, r, canonical, func(ctx context.Context, tx store.Tx) (int, any, error) {
+		a, err := tx.OpenCustomerAccount(ctx, partnerOf(r).ID, currency, req.CustomerRef)
+		if err != nil {
+			return 0, nil, err
+		}
+		return http.StatusCreated, toAccountJSON(a), nil
+	})
 }
 
 // GET /v1/accounts/{id}

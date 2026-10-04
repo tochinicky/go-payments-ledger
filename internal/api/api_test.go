@@ -55,8 +55,29 @@ func newClient(t *testing.T, fundingLimit int64) client {
 	return client{t: t, key: key, settlement: settlement}
 }
 
-// do sends a request and decodes the JSON answer into a map.
+// do sends a request and decodes the JSON answer into a map. Writes get a fresh Idempotency-Key.
 func (c client) do(method, path, body string) (int, map[string]any) {
+	c.t.Helper()
+	key := ""
+	if method == http.MethodPost {
+		key = uuid.NewString()
+	}
+	resp := c.send(method, path, body, key)
+	var out map[string]any
+	if err := json.Unmarshal(resp.body, &out); err != nil {
+		c.t.Fatalf("%s %s: %d, body %q is not JSON", method, path, resp.status, resp.body)
+	}
+	return resp.status, out
+}
+
+// response is an HTTP answer, with the body as raw bytes so replays can be compared byte for byte.
+type response struct {
+	status int
+	header http.Header
+	body   []byte
+}
+
+func (c client) send(method, path, body, idempotencyKey string) response {
 	c.t.Helper()
 	req, err := http.NewRequestWithContext(context.Background(), method, srv.URL+path, strings.NewReader(body))
 	if err != nil {
@@ -64,6 +85,9 @@ func (c client) do(method, path, body string) (int, map[string]any) {
 	}
 	if c.key != "" {
 		req.Header.Set("Authorization", "Bearer "+c.key)
+	}
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
 	}
 	resp, err := srv.Client().Do(req)
 	if err != nil {
@@ -74,14 +98,10 @@ func (c client) do(method, path, body string) (int, map[string]any) {
 	if err != nil {
 		c.t.Fatal(err)
 	}
-	var out map[string]any
-	if err := json.Unmarshal(raw, &out); err != nil {
-		c.t.Fatalf("%s %s: %d, body %q is not JSON", method, path, resp.StatusCode, raw)
-	}
 	if resp.StatusCode >= 400 && resp.Header.Get("Content-Type") != "application/problem+json" {
 		c.t.Errorf("%s %s: error with content type %q", method, path, resp.Header.Get("Content-Type"))
 	}
-	return resp.StatusCode, out
+	return response{status: resp.StatusCode, header: resp.Header, body: raw}
 }
 
 func (c client) openAccount() string {

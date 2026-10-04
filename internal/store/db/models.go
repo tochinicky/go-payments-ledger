@@ -27,6 +27,19 @@ type Balance struct {
 	Version     int64
 }
 
+type Idempotency struct {
+	PartnerID    uuid.UUID
+	Key          string
+	RequestHash  []byte
+	Status       string
+	LeaseToken   *uuid.UUID
+	LockedUntil  pgtype.Timestamptz
+	ResponseCode *int32
+	ResponseBody []byte
+	CreatedAt    pgtype.Timestamptz
+	CompletedAt  pgtype.Timestamptz
+}
+
 type Partner struct {
 	ID                uuid.UUID
 	Name              string

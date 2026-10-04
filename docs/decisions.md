@@ -101,3 +101,25 @@ The decisions the build depends on, each with its reason:
   - **Statement order:** entries carry account_seq 1…n; after a hold-like version bump, the next entry's account_seq equals the balance version.
   - **API:** the happy path, statement pagination, and the error catalogue (401, 404 across partners, 400, 413, 422).
 
+## Slice 3: idempotency
+
+- **Keys live in Postgres, and the response is stored in the same transaction as the money movement.** A crash can't separate "moved the money" from "remembered the answer".
+- **Claim, then work.** A request claims `(partner, key)` with an `INSERT … ON CONFLICT DO NOTHING`, in its own short transaction, with a 30 s lease timed on the database clock and a random lease token. If the key exists, a plain read (no lock, so it never waits on the running attempt) decides:
+  - a different request hash: `422 idempotency_key_reused`, whatever the key's state;
+  - completed: replay;
+  - a live lease: `409 idempotency_in_progress`;
+  - a lapsed lease: take over with a conditional UPDATE.
+  A short loop covers keys freed or completed while we looked.
+- **Fencing.** The ledger transaction starts with `SELECT … FOR UPDATE` on its own claim (`lease_token = mine AND status = 'in_progress'`). If the claim is gone, it stops before touching money. While it works, the row lock makes any takeover wait; once it commits, the takeover's UPDATE re-checks its conditions, finds the key completed, and replays instead. A slow attempt and its replacement can never both post.
+- **What is stored:** 2xx responses and business refusals (`insufficient_funds`, `not_found`, …). A refusal stays a refusal for its key, and a new key is how you try again. Validation (400) and auth (401) happen before the claim, so they store nothing and a corrected request can reuse its key. 5xx failures aren't stored: the key is freed so a retry runs again.
+- **Freeing a key is conditional:** `DELETE … WHERE status = 'in_progress' AND lease_token = mine`, on a fresh context (the request's own may be what failed). If the failure was a lost COMMIT acknowledgement, the key is already completed and stays, and the retry gets the stored answer. If the database is unreachable, the lease simply expires.
+- **The request hash is SHA-256 of the route, the actual path and the canonical JSON of the validated request**, so whitespace, field order and formatting don't turn a retry into "key reused", and the same key on another route is a different request.
+- **Replays are byte for byte**: the stored body is the exact bytes first sent, with `Idempotent-Replayed: true`. The `Location` header on account creation was dropped so a replay matches the original exactly.
+- **Why 409 instead of waiting for the first attempt:** waiting holds a connection and a server goroutine per retry for as long as the slowest attempt, and a retry storm would multiply that. A 409 with `Retry-After: 1` costs one read, and the client retries when the answer is likely ready. Waiting would be friendlier for clients that don't retry, at the cost of the server's capacity under exactly the load that causes retries.
+- **Cleanup:** ledger-api deletes completed keys older than the retention (24 h, `IDEMPOTENCY_RETENTION`), and in-progress claims abandoned that long, once a minute in batches of 1,000 with `FOR UPDATE SKIP LOCKED`, so replicas share the work. A live claim is never touched.
+- **A 503 `unavailable` (with `Retry-After: 1`) when the database can't be reached**, a 500 `internal` otherwise; neither is stored.
+- **Tests:**
+  - **Store:** the claim lifecycle (new, in progress, reused, replay, per partner); a lapsed lease is taken over and the old attempt is fenced (one transaction); a takeover waits for an attempt still inside its transaction, then replays; release frees only its own in-progress claim (a completed key and a taken-over claim survive); cleanup deletes only expired keys, across batches.
+  - **API:** the key is required; a replay is byte-identical even with the JSON reordered; a different request with the same key is refused, including on another route; a refusal is stored but a validation error isn't.
+  - **Retry storm (scenario 1):** 50 identical requests with one key, with the settlement row held locked so the first request is really in flight. Result: exactly one 201 and 49 409s with `Retry-After`, a final retry gets the identical 201, and exactly one transaction.
+

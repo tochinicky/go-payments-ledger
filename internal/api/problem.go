@@ -4,7 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/tochinicky/go-payments-ledger/internal/ledger"
 )
@@ -25,29 +28,32 @@ type fieldError struct {
 	Reason string `json:"reason"`
 }
 
-// statusOf maps the ledger's error codes to HTTP statuses (the error catalogue). A missing code is a bug: 500.
+// statusOf maps error codes to HTTP statuses (the error catalogue). A code missing here is a bug: 500.
 var statusOf = map[string]int{
-	"validation_failed":    http.StatusBadRequest,
-	"malformed_json":       http.StatusBadRequest,
-	"unauthenticated":      http.StatusUnauthorized,
-	"not_found":            http.StatusNotFound,
-	"body_too_large":       http.StatusRequestEntityTooLarge,
-	"account_not_active":   http.StatusConflict,
-	"insufficient_funds":   http.StatusUnprocessableEntity,
-	"currency_mismatch":    http.StatusUnprocessableEntity,
-	"same_account":         http.StatusUnprocessableEntity,
-	"account_not_empty":    http.StatusConflict,
-	"account_not_closable": http.StatusConflict,
+	"validation_failed":        http.StatusBadRequest,
+	"malformed_json":           http.StatusBadRequest,
+	"idempotency_key_required": http.StatusBadRequest,
+	"unauthenticated":          http.StatusUnauthorized,
+	"not_found":                http.StatusNotFound,
+	"body_too_large":           http.StatusRequestEntityTooLarge,
+	"idempotency_in_progress":  http.StatusConflict,
+	"account_not_active":       http.StatusConflict,
+	"account_not_empty":        http.StatusConflict,
+	"account_not_closable":     http.StatusConflict,
+	"idempotency_key_reused":   http.StatusUnprocessableEntity,
+	"insufficient_funds":       http.StatusUnprocessableEntity,
+	"currency_mismatch":        http.StatusUnprocessableEntity,
+	"same_account":             http.StatusUnprocessableEntity,
+	"unavailable":              http.StatusServiceUnavailable,
 }
 
-func writeProblem(w http.ResponseWriter, code, detail string, fields ...fieldError) {
+// problemResponse renders a problem as a status and body, ready to send or to store with an idempotency key.
+func problemResponse(code, detail string, fields ...fieldError) (int, []byte) {
 	status, ok := statusOf[code]
 	if !ok {
 		status, code, detail = http.StatusInternalServerError, "internal", ""
 	}
-	w.Header().Set("Content-Type", "application/problem+json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(problem{
+	return status, mustJSON(problem{
 		Type:   "https://errors.ledger.example/" + code,
 		Title:  http.StatusText(status),
 		Status: status,
@@ -57,20 +63,67 @@ func writeProblem(w http.ResponseWriter, code, detail string, fields ...fieldErr
 	})
 }
 
-// writeError answers with a business error's code and message, or a bare 500 for anything else. The cause of a 500
-// is logged, never sent: it can name tables, constraints or hosts.
-func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
+func writeProblem(w http.ResponseWriter, code, detail string, fields ...fieldError) {
+	status, body := problemResponse(code, detail, fields...)
+	if code == "idempotency_in_progress" || code == "unavailable" { // both are worth retrying shortly
+		w.Header().Set("Retry-After", "1")
+	}
+	writeBody(w, status, body)
+}
+
+// businessError reports whether err is a business refusal (a deterministic 4xx), and renders it.
+func businessError(err error) (status int, body []byte, ok bool) {
 	var lerr *ledger.Error
-	if errors.As(err, &lerr) && lerr.Code != "internal" {
-		writeProblem(w, lerr.Code, lerr.Message)
+	if !errors.As(err, &lerr) || lerr.Code == "internal" {
+		return 0, nil, false
+	}
+	status, body = problemResponse(lerr.Code, lerr.Message)
+	return status, body, true
+}
+
+// writeError answers with a business error's code and message; with 503 when the database couldn't be reached
+// (worth retrying); or with a bare 500. The cause of a 5xx is logged, never sent: it can name tables or hosts.
+func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
+	if status, body, ok := businessError(err); ok {
+		writeBody(w, status, body)
 		return
 	}
 	s.log.ErrorContext(r.Context(), "request failed", slog.String("method", r.Method), slog.String("path", r.URL.Path), slog.Any("error", err))
+	if unavailable(err) {
+		writeProblem(w, "unavailable", "")
+		return
+	}
 	writeProblem(w, "internal", "")
 }
 
+// unavailable reports whether err means the database couldn't be reached or didn't answer in time, rather than a bug.
+func unavailable(err error) bool {
+	var netErr net.Error
+	var connectErr *pgconn.ConnectError
+	return errors.As(err, &netErr) || errors.As(err, &connectErr) || pgconn.Timeout(err)
+}
+
 func writeJSON(w http.ResponseWriter, status int, body any) {
-	w.Header().Set("Content-Type", "application/json")
+	writeBody(w, status, mustJSON(body))
+}
+
+// writeBody sends a rendered JSON body: problem+json for errors.
+func writeBody(w http.ResponseWriter, status int, body []byte) {
+	if status >= 400 {
+		w.Header().Set("Content-Type", "application/problem+json")
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+	}
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(body)
+	_, _ = w.Write(body) //nolint:gosec // G705: always JSON we rendered, served as JSON with nosniff, never HTML
+}
+
+// mustJSON marshals the API's own response types, which always marshal.
+func mustJSON(v any) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return append(b, '\n')
 }
