@@ -48,13 +48,21 @@ CREATE TABLE balances (
     version      bigint NOT NULL DEFAULT 0
 );
 
--- Invariant 3 in the database too: no balance write may leave available (posted − held) below the account's floor.
--- The store checks first and refuses with insufficient_funds; this catches a bug in that check, failing the
--- transaction instead of committing an overdraft. min_balance_minor is a primary-key lookup.
+-- Invariant 3 in the database too: a balance write may not leave available (posted − held) below the account's floor
+-- AND lower than it was. The store checks first and refuses with insufficient_funds; this catches a bug in that
+-- check, failing the transaction instead of committing an overdraft. A write that improves available is always
+-- allowed: if a floor is raised above an account's current position (a lowered funding limit), the transfers that
+-- bring it back must still go through, or the account would be stuck. min_balance_minor is a primary-key lookup.
 -- +goose StatementBegin
 CREATE FUNCTION check_balance_floor() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    old_available bigint := 0;  -- an inserted balance starts from nothing
 BEGIN
-    IF NEW.posted_minor - NEW.held_minor < (SELECT min_balance_minor FROM accounts WHERE id = NEW.account_id) THEN
+    IF TG_OP = 'UPDATE' THEN
+        old_available := OLD.posted_minor - OLD.held_minor;
+    END IF;
+    IF NEW.posted_minor - NEW.held_minor < (SELECT min_balance_minor FROM accounts WHERE id = NEW.account_id)
+       AND NEW.posted_minor - NEW.held_minor < old_available THEN
         RAISE EXCEPTION 'account % would go below its floor', NEW.account_id USING ERRCODE = 'check_violation';
     END IF;
     RETURN NEW;

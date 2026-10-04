@@ -202,8 +202,8 @@ func TestPostingsAreAppendOnly(t *testing.T) {
 	}
 }
 
-// Invariant 3 in the database: a balance update that leaves available below the account's floor fails, so a bug
-// in the funds check would refuse the transfer instead of committing an overdraft.
+// Invariant 3 in the database: a balance update that leaves available below the account's floor, and lower than it
+// was, fails, so a bug in the funds check would refuse the transfer instead of committing an overdraft.
 func TestBalanceBelowItsFloorCannotBeWritten(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t, 1_000)
@@ -221,6 +221,35 @@ func TestBalanceBelowItsFloorCannotBeWritten(t *testing.T) {
 	_, err := tdb.App.Exec(ctx, "UPDATE balances SET posted_minor = -1000 WHERE account_id = $1", f.settlement)
 	if err != nil {
 		t.Errorf("settlement down to minus its funding limit: %v", err)
+	}
+}
+
+// When a floor is raised above an account's position (a partner's funding limit lowered while its settlement
+// account is deep in use), the account can't spend, but transfers that improve its position still go through:
+// otherwise the very withdrawals that cure the breach would be refused and the account would be stuck.
+func TestAccountBelowARaisedFloorCanRecoverButNotSpend(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, 1_000)
+	alice := f.open(t, eur)
+	f.transfer(t, f.settlement, alice, 900) // settlement at −900
+	if _, err := tdb.Owner.Exec(ctx, "UPDATE accounts SET min_balance_minor = -500 WHERE id = $1", f.settlement); err != nil {
+		t.Fatal(err) // the funding limit lowered to 500: settlement is now 400 below its floor
+	}
+
+	f.transfer(t, alice, f.settlement, 100) // a withdrawal into settlement: −800, still below the floor, but better
+	if got := f.balance(t, f.settlement).Posted; got != -800 {
+		t.Fatalf("settlement = %d, want -800", got)
+	}
+	_, err := f.store.Transfer(ctx, f.partner.ID, f.settlement, alice, ledger.Money{Amount: 1, Currency: eur}, nil)
+	if !errors.Is(err, ledger.ErrInsufficientFunds) {
+		t.Fatalf("funding while below the floor: err = %v, want insufficient_funds", err)
+	}
+	// The database layer agrees: a worsening write below the floor fails, an improving one passes.
+	if _, err := tdb.App.Exec(ctx, "UPDATE balances SET posted_minor = -801 WHERE account_id = $1", f.settlement); pgCode(err) != "23514" {
+		t.Errorf("worsening write: err = %v, want check_violation", err)
+	}
+	if _, err := tdb.App.Exec(ctx, "UPDATE balances SET posted_minor = -700 WHERE account_id = $1", f.settlement); err != nil {
+		t.Errorf("improving write: %v", err)
 	}
 }
 
