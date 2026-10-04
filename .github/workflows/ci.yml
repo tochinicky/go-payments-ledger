@@ -30,6 +30,16 @@ jobs:
       # GitHub's Linux runners have Docker.
       - run: go test -race -count=1 ./...
 
+  # The store-vs-Book property test at 1,000 random sequences (default runs use rapid's 100, to keep them quick).
+  property:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -race -count=1 -run TestStoreAgreesWithTheBook ./internal/store/ -rapid.checks=1000 -v
+
   build:
     runs-on: ubuntu-24.04
     steps:

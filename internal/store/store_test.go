@@ -7,6 +7,7 @@ import (
 	"math"
 	mathrand "math/rand/v2"
 	"os"
+	"slices"
 	"sync"
 	"testing"
 
@@ -201,6 +202,28 @@ func TestPostingsAreAppendOnly(t *testing.T) {
 	}
 }
 
+// Invariant 3 in the database: a balance update that leaves available below the account's floor fails, so a bug
+// in the funds check would refuse the transfer instead of committing an overdraft.
+func TestBalanceBelowItsFloorCannotBeWritten(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, 1_000)
+	alice := f.open(t, eur)
+	f.transfer(t, f.settlement, alice, 100)
+	for _, stmt := range []string{
+		"UPDATE balances SET posted_minor = -1 WHERE account_id = $1",
+		"UPDATE balances SET held_minor = 101 WHERE account_id = $1",
+	} {
+		_, err := tdb.App.Exec(ctx, stmt, alice)
+		if code := pgCode(err); code != "23514" { // check_violation
+			t.Errorf("%q: err = %v, want check_violation", stmt, err)
+		}
+	}
+	_, err := tdb.App.Exec(ctx, "UPDATE balances SET posted_minor = -1000 WHERE account_id = $1", f.settlement)
+	if err != nil {
+		t.Errorf("settlement down to minus its funding limit: %v", err)
+	}
+}
+
 // Invariant 1 in the database: a transaction whose postings don't sum to zero can't commit, whatever wrote it.
 func TestUnbalancedTransactionCannotCommit(t *testing.T) {
 	ctx := context.Background()
@@ -215,7 +238,7 @@ func TestUnbalancedTransactionCannotCommit(t *testing.T) {
 	if _, err := tx.Exec(ctx, "INSERT INTO transactions (id, partner_id, kind) VALUES ($1, $2, 'transfer')", txID, f.partner.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Exec(ctx, "INSERT INTO postings (id, transaction_id, account_id, amount_minor, currency) VALUES ($1, $2, $3, 100, 'EUR')",
+	if _, err := tx.Exec(ctx, "INSERT INTO postings (id, transaction_id, account_id, amount_minor, currency, account_seq) VALUES ($1, $2, $3, 100, 'EUR', 99)",
 		uuid.New(), txID, alice); err != nil {
 		t.Fatal(err)
 	}
@@ -357,17 +380,17 @@ func TestStoreAgreesWithTheBook(t *testing.T) {
 	})
 }
 
-func TestStatementPagesWithAKeysetCursor(t *testing.T) {
+func TestStatementPagesByAccountSeq(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t, 1_000)
 	alice := f.open(t, eur)
 	for i := range 5 {
 		f.transfer(t, f.settlement, alice, int64(10+i))
 	}
-	var got []int64
-	var cursor store.Cursor
+	var amounts, seqs []int64
+	var after int64
 	for {
-		page, err := f.store.Statement(ctx, f.partner.ID, alice, cursor, 2)
+		page, err := f.store.Statement(ctx, f.partner.ID, alice, after, 2)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -375,23 +398,70 @@ func TestStatementPagesWithAKeysetCursor(t *testing.T) {
 			break
 		}
 		for _, e := range page {
-			got = append(got, e.Amount.Amount)
+			amounts = append(amounts, e.Amount.Amount)
+			seqs = append(seqs, e.AccountSeq)
 		}
-		last := page[len(page)-1]
-		cursor = store.Cursor{CreatedAt: last.CreatedAt, PostingID: last.PostingID}
+		after = page[len(page)-1].AccountSeq
 	}
-	want := []int64{10, 11, 12, 13, 14}
-	if len(got) != len(want) {
-		t.Fatalf("entries = %v, want %v", got, want)
+	if want := []int64{10, 11, 12, 13, 14}; !slices.Equal(amounts, want) {
+		t.Fatalf("amounts = %v, want %v", amounts, want)
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("entries = %v, want %v", got, want)
-		}
+	if want := []int64{1, 2, 3, 4, 5}; !slices.Equal(seqs, want) {
+		t.Fatalf("account_seq = %v, want %v", seqs, want)
 	}
 
 	other := newFixture(t, 0)
-	if _, err := other.store.Statement(ctx, other.partner.ID, alice, store.Cursor{}, 10); !errors.Is(err, ledger.ErrNotFound) {
+	if _, err := other.store.Statement(ctx, other.partner.ID, alice, 0, 10); !errors.Is(err, ledger.ErrNotFound) {
 		t.Errorf("another partner's statement: err = %v, want not_found", err)
+	}
+}
+
+// A hold changes an account's money without a posting, but still takes a version: each ledger operation gets one
+// account_seq (the event it will publish carries the same number). So a statement may skip a number, and the entry
+// after a hold carries the version that includes it. Holds arrive with their own slice; until then the test makes
+// the bump a hold placement would.
+func TestPostingSeqIsTheBalanceVersionItProduced(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, 1_000)
+	alice := f.open(t, eur)
+	f.transfer(t, f.settlement, alice, 100) // version 1
+	if _, err := tdb.Owner.Exec(ctx, "UPDATE balances SET held_minor = held_minor + 30, version = version + 1 WHERE account_id = $1", alice); err != nil {
+		t.Fatal(err) // version 2: what placing a hold of 30 does
+	}
+	bob := f.open(t, eur)
+	f.transfer(t, alice, bob, 50) // version 3
+
+	page, err := f.store.Statement(ctx, f.partner.ID, alice, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 2 || page[0].AccountSeq != 1 || page[1].AccountSeq != 3 {
+		t.Fatalf("statement = %+v, want account_seq 1 then 3", page)
+	}
+	if v := f.balance(t, alice).Version; v != page[1].AccountSeq {
+		t.Errorf("balance version %d, last entry's account_seq %d: they must agree", v, page[1].AccountSeq)
+	}
+}
+
+// UNIQUE (account_id, account_seq) turns a lost update into a hard error: a second posting claiming a version the
+// account already used can't be written, so two entries can never share a place in the account's order.
+func TestDuplicateAccountSeqIsRefused(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, 1_000)
+	alice := f.open(t, eur)
+	f.transfer(t, f.settlement, alice, 100)
+	tx, err := tdb.Owner.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	txID := uuid.New()
+	if _, err := tx.Exec(ctx, "INSERT INTO transactions (id, partner_id, kind) VALUES ($1, $2, 'transfer')", txID, f.partner.ID); err != nil {
+		t.Fatal(err)
+	}
+	_, err = tx.Exec(ctx, "INSERT INTO postings (id, transaction_id, account_id, amount_minor, currency, account_seq) VALUES ($1, $2, $3, 1, 'EUR', 1)",
+		uuid.New(), txID, alice)
+	if code := pgCode(err); code != "23505" { // unique_violation
+		t.Fatalf("err = %v, want unique_violation", err)
 	}
 }

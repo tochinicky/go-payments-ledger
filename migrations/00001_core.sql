@@ -48,6 +48,21 @@ CREATE TABLE balances (
     version      bigint NOT NULL DEFAULT 0
 );
 
+-- Invariant 3 in the database too: no balance write may leave available (posted − held) below the account's floor.
+-- The store checks first and refuses with insufficient_funds; this catches a bug in that check, failing the
+-- transaction instead of committing an overdraft. min_balance_minor is a primary-key lookup.
+-- +goose StatementBegin
+CREATE FUNCTION check_balance_floor() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.posted_minor - NEW.held_minor < (SELECT min_balance_minor FROM accounts WHERE id = NEW.account_id) THEN
+        RAISE EXCEPTION 'account % would go below its floor', NEW.account_id USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END
+$$;
+-- +goose StatementEnd
+CREATE TRIGGER balances_floor BEFORE INSERT OR UPDATE ON balances FOR EACH ROW EXECUTE FUNCTION check_balance_floor();
+
 CREATE TABLE transactions (
     id         uuid PRIMARY KEY,
     partner_id uuid        NOT NULL REFERENCES partners (id),
@@ -63,9 +78,13 @@ CREATE TABLE postings (
     account_id     uuid        NOT NULL REFERENCES accounts (id),
     amount_minor   bigint      NOT NULL CHECK (amount_minor <> 0),  -- signed: credit +, debit −
     currency       char(3)     NOT NULL,
-    created_at     timestamptz NOT NULL DEFAULT now()
+    -- The account's balance version this entry produced: the account's own sequence, taken under its row lock,
+    -- and the same number its event carries. Statements are ordered by it. Unique per account, so two writers
+    -- that both think they produced version n (a lost update) fail instead of corrupting the order.
+    account_seq    bigint      NOT NULL CHECK (account_seq > 0),
+    created_at     timestamptz NOT NULL DEFAULT now(),  -- for display; never used for ordering
+    UNIQUE (account_id, account_seq)                    -- also the statement's keyset index
 );
-CREATE INDEX postings_statement ON postings (account_id, created_at, id);  -- keyset pagination of a statement
 CREATE INDEX postings_transaction ON postings (transaction_id);
 
 -- Invariant 1 in the database itself: at COMMIT, each transaction's postings sum to zero per currency.
@@ -120,3 +139,4 @@ DROP TABLE accounts;
 DROP TABLE partners;
 DROP FUNCTION forbid_change;
 DROP FUNCTION check_postings_balance;
+DROP FUNCTION check_balance_floor;

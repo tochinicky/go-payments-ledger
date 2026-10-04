@@ -42,6 +42,7 @@ type Posting struct {
 	AccountID     uuid.UUID
 	AmountMinor   int64
 	Currency      string
+	AccountSeq    int64
 	CreatedAt     pgtype.Timestamptz
 }
 

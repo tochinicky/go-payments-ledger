@@ -11,7 +11,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/tochinicky/go-payments-ledger/internal/ledger"
@@ -63,16 +62,11 @@ type Transfer struct {
 type Entry struct {
 	PostingID     uuid.UUID
 	TransactionID uuid.UUID
+	AccountSeq    int64 // the account's balance version this entry produced; statements are in this order
 	Kind          ledger.TransactionKind
 	Reference     *string
 	Amount        ledger.Money
 	CreatedAt     time.Time
-}
-
-// Cursor marks a position in a statement: the last entry of the previous page. The zero Cursor is the start.
-type Cursor struct {
-	CreatedAt time.Time
-	PostingID uuid.UUID
 }
 
 // CreatePartner adds a partner and its settlement account in each currency, whose floor is minus the funding limit.
@@ -251,8 +245,9 @@ func lockAccounts(ctx context.Context, q *db.Queries, partnerID uuid.UUID, ids .
 	return locked, nil
 }
 
-// post writes a transaction's postings and applies them to the locked balances. Every new balance is computed
-// with checked arithmetic first, so an overflow writes nothing.
+// post applies a transaction's postings to the locked balances and writes them. Every new balance is computed with
+// checked arithmetic first, so an overflow writes nothing. Each posting records the balance version it produced as
+// its account_seq.
 func (s *Store) post(ctx context.Context, q *db.Queries, txID uuid.UUID, postings []ledger.Posting, locked map[uuid.UUID]lockedAccount) error {
 	for _, p := range postings {
 		posted := ledger.Money{Amount: locked[p.AccountID].balance.Posted, Currency: p.Amount.Currency}
@@ -261,40 +256,37 @@ func (s *Store) post(ctx context.Context, q *db.Queries, txID uuid.UUID, posting
 		}
 	}
 	for _, p := range postings {
+		balance, err := q.AddToPosted(ctx, db.AddToPostedParams{AccountID: p.AccountID, Delta: p.Amount.Amount})
+		if err != nil {
+			return fmt.Errorf("update balance: %w", err)
+		}
 		if err := q.InsertPosting(ctx, db.InsertPostingParams{
-			ID: s.newID(), TransactionID: txID, AccountID: p.AccountID, AmountMinor: p.Amount.Amount, Currency: string(p.Amount.Currency),
+			ID: s.newID(), TransactionID: txID, AccountID: p.AccountID, AmountMinor: p.Amount.Amount,
+			Currency: string(p.Amount.Currency), AccountSeq: balance.Version,
 		}); err != nil {
 			return fmt.Errorf("insert posting: %w", err)
-		}
-		if _, err := q.AddToPosted(ctx, db.AddToPostedParams{AccountID: p.AccountID, Delta: p.Amount.Amount}); err != nil {
-			return fmt.Errorf("update balance: %w", err)
 		}
 	}
 	return nil
 }
 
-// Statement returns up to limit entries of one of the partner's accounts after cursor, oldest first.
-func (s *Store) Statement(ctx context.Context, partnerID, accountID uuid.UUID, after Cursor, limit int32) ([]Entry, error) {
+// Statement returns up to limit entries of one of the partner's accounts with account_seq above afterSeq, in
+// account_seq order. afterSeq 0 is the start.
+func (s *Store) Statement(ctx context.Context, partnerID, accountID uuid.UUID, afterSeq int64, limit int32) ([]Entry, error) {
 	q := db.New(s.pool)
 	if _, err := accountView(ctx, q, partnerID, accountID); err != nil {
 		return nil, err
 	}
-	// The zero cursor starts before every row: -infinity sorts first, and uuid.Nil is the smallest id.
-	afterAt := pgtype.Timestamptz{Time: after.CreatedAt, Valid: true}
-	if after.CreatedAt.IsZero() {
-		afterAt = pgtype.Timestamptz{InfinityModifier: pgtype.NegativeInfinity, Valid: true}
-	}
-	rows, err := q.Statement(ctx, db.StatementParams{
-		AccountID: accountID, AfterCreatedAt: afterAt, AfterID: after.PostingID, PageSize: limit,
-	})
+	rows, err := q.Statement(ctx, db.StatementParams{AccountID: accountID, AfterSeq: afterSeq, PageSize: limit})
 	if err != nil {
 		return nil, fmt.Errorf("statement: %w", err)
 	}
 	entries := make([]Entry, 0, len(rows))
 	for _, r := range rows {
 		entries = append(entries, Entry{
-			PostingID: r.ID, TransactionID: r.TransactionID, Kind: ledger.TransactionKind(r.Kind), Reference: r.Reference,
-			Amount: ledger.Money{Amount: r.AmountMinor, Currency: ledger.Currency(r.Currency)}, CreatedAt: r.CreatedAt.Time,
+			PostingID: r.ID, TransactionID: r.TransactionID, AccountSeq: r.AccountSeq, Kind: ledger.TransactionKind(r.Kind),
+			Reference: r.Reference, Amount: ledger.Money{Amount: r.AmountMinor, Currency: ledger.Currency(r.Currency)},
+			CreatedAt: r.CreatedAt.Time,
 		})
 	}
 	return entries, nil

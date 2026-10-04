@@ -151,8 +151,8 @@ func (q *Queries) InsertPartner(ctx context.Context, arg InsertPartnerParams) er
 }
 
 const insertPosting = `-- name: InsertPosting :exec
-INSERT INTO postings (id, transaction_id, account_id, amount_minor, currency, created_at)
-VALUES ($1, $2, $3, $4, $5, clock_timestamp())
+INSERT INTO postings (id, transaction_id, account_id, amount_minor, currency, account_seq, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, clock_timestamp())
 `
 
 type InsertPostingParams struct {
@@ -161,11 +161,11 @@ type InsertPostingParams struct {
 	AccountID     uuid.UUID
 	AmountMinor   int64
 	Currency      string
+	AccountSeq    int64
 }
 
-// created_at is clock_timestamp(), not now(): now() is when the transaction began, before it waited for the account
-// lock. Taken after the lock, an account's posting times follow its commit order, so a statement page already read
-// can never gain an earlier row later (which keyset pagination would skip).
+// account_seq is the version AddToPosted just returned for this account. created_at is clock_timestamp() (when the
+// row was written, after the lock wait) rather than now() (when the transaction began); it is only displayed.
 func (q *Queries) InsertPosting(ctx context.Context, arg InsertPostingParams) error {
 	_, err := q.db.Exec(ctx, insertPosting,
 		arg.ID,
@@ -173,6 +173,7 @@ func (q *Queries) InsertPosting(ctx context.Context, arg InsertPostingParams) er
 		arg.AccountID,
 		arg.AmountMinor,
 		arg.Currency,
+		arg.AccountSeq,
 	)
 	return err
 }
@@ -287,19 +288,17 @@ func (q *Queries) PartnerByKeyHash(ctx context.Context, apiKeyHash []byte) (Part
 }
 
 const statement = `-- name: Statement :many
-SELECT p.id, p.transaction_id, p.amount_minor, p.currency, p.created_at, t.kind, t.reference
+SELECT p.id, p.transaction_id, p.amount_minor, p.currency, p.account_seq, p.created_at, t.kind, t.reference
 FROM postings p JOIN transactions t ON t.id = p.transaction_id
-WHERE p.account_id = $1
-  AND (p.created_at, p.id) > ($2::timestamptz, $3::uuid)
-ORDER BY p.created_at, p.id
-LIMIT $4
+WHERE p.account_id = $1 AND p.account_seq > $2
+ORDER BY p.account_seq
+LIMIT $3
 `
 
 type StatementParams struct {
-	AccountID      uuid.UUID
-	AfterCreatedAt pgtype.Timestamptz
-	AfterID        uuid.UUID
-	PageSize       int32
+	AccountID uuid.UUID
+	AfterSeq  int64
+	PageSize  int32
 }
 
 type StatementRow struct {
@@ -307,20 +306,17 @@ type StatementRow struct {
 	TransactionID uuid.UUID
 	AmountMinor   int64
 	Currency      string
+	AccountSeq    int64
 	CreatedAt     pgtype.Timestamptz
 	Kind          string
 	Reference     *string
 }
 
-// Keyset pagination: "the next page after (created_at, id)". Unlike OFFSET, it costs the same on page 1000 as on
-// page 1, and rows added meanwhile can't shift a page.
+// Keyset pagination: "the next page after account_seq n". Unlike OFFSET, it costs the same on page 1000 as on page 1,
+// and rows added meanwhile can't shift a page. A sequence rather than a timestamp: account_seq is assigned under the
+// account's lock, so it follows commit order by construction, whatever the clock does.
 func (q *Queries) Statement(ctx context.Context, arg StatementParams) ([]StatementRow, error) {
-	rows, err := q.db.Query(ctx, statement,
-		arg.AccountID,
-		arg.AfterCreatedAt,
-		arg.AfterID,
-		arg.PageSize,
-	)
+	rows, err := q.db.Query(ctx, statement, arg.AccountID, arg.AfterSeq, arg.PageSize)
 	if err != nil {
 		return nil, err
 	}
@@ -333,6 +329,7 @@ func (q *Queries) Statement(ctx context.Context, arg StatementParams) ([]Stateme
 			&i.TransactionID,
 			&i.AmountMinor,
 			&i.Currency,
+			&i.AccountSeq,
 			&i.CreatedAt,
 			&i.Kind,
 			&i.Reference,

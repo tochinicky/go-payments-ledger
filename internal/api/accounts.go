@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -139,6 +138,7 @@ func (s *Server) getStatement(w http.ResponseWriter, r *http.Request) {
 	type entryJSON struct {
 		PostingID     uuid.UUID `json:"posting_id"`
 		TransactionID uuid.UUID `json:"transaction_id"`
+		AccountSeq    int64     `json:"account_seq"`
 		Kind          string    `json:"kind"`
 		Reference     *string   `json:"reference"`
 		AmountMinor   int64     `json:"amount_minor"`
@@ -151,42 +151,33 @@ func (s *Server) getStatement(w http.ResponseWriter, r *http.Request) {
 	}{Entries: []entryJSON{}}
 	for i, e := range entries {
 		if i == limit {
-			last := entries[limit-1]
-			body.NextCursor = encodeCursor(store.Cursor{CreatedAt: last.CreatedAt, PostingID: last.PostingID})
+			body.NextCursor = encodeCursor(entries[limit-1].AccountSeq)
 			break
 		}
 		body.Entries = append(body.Entries, entryJSON{
-			e.PostingID, e.TransactionID, string(e.Kind), e.Reference, e.Amount.Amount, string(e.Amount.Currency), e.CreatedAt.UTC(),
+			e.PostingID, e.TransactionID, e.AccountSeq, string(e.Kind), e.Reference, e.Amount.Amount, string(e.Amount.Currency), e.CreatedAt.UTC(),
 		})
 	}
 	writeJSON(w, http.StatusOK, body)
 }
 
-// A cursor is "<created_at in Unix microseconds>:<posting id>", base64url-encoded so clients treat it as opaque.
-// Microseconds are Postgres's timestamp precision, so the round trip is exact.
-func encodeCursor(c store.Cursor) string {
-	return base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil, "%d:%s", c.CreatedAt.UnixMicro(), c.PostingID))
+// A cursor is the account_seq of the last entry on the previous page, base64url-encoded so clients treat it as
+// opaque (it can change shape without breaking them).
+func encodeCursor(seq int64) string {
+	return base64.RawURLEncoding.EncodeToString(strconv.AppendInt(nil, seq, 10))
 }
 
-func decodeCursor(s string) (store.Cursor, error) {
+func decodeCursor(s string) (int64, error) {
 	if s == "" {
-		return store.Cursor{}, nil
+		return 0, nil
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(s)
 	if err != nil {
-		return store.Cursor{}, err
+		return 0, err
 	}
-	micros, id, ok := strings.Cut(string(raw), ":")
-	if !ok {
-		return store.Cursor{}, fmt.Errorf("cursor %q: no separator", s)
+	seq, err := strconv.ParseInt(string(raw), 10, 64)
+	if err != nil || seq < 0 {
+		return 0, fmt.Errorf("cursor %q is not a position in a statement", s)
 	}
-	us, err := strconv.ParseInt(micros, 10, 64)
-	if err != nil {
-		return store.Cursor{}, err
-	}
-	postingID, err := uuid.Parse(id)
-	if err != nil {
-		return store.Cursor{}, err
-	}
-	return store.Cursor{CreatedAt: time.UnixMicro(us), PostingID: postingID}, nil
+	return seq, nil
 }

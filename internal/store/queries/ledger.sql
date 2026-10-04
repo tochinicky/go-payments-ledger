@@ -41,21 +41,20 @@ INSERT INTO transactions (id, partner_id, kind, reference) VALUES ($1, $2, $3, $
 RETURNING created_at;
 
 -- name: InsertPosting :exec
--- created_at is clock_timestamp(), not now(): now() is when the transaction began, before it waited for the account
--- lock. Taken after the lock, an account's posting times follow its commit order, so a statement page already read
--- can never gain an earlier row later (which keyset pagination would skip).
-INSERT INTO postings (id, transaction_id, account_id, amount_minor, currency, created_at)
-VALUES ($1, $2, $3, $4, $5, clock_timestamp());
+-- account_seq is the version AddToPosted just returned for this account. created_at is clock_timestamp() (when the
+-- row was written, after the lock wait) rather than now() (when the transaction began); it is only displayed.
+INSERT INTO postings (id, transaction_id, account_id, amount_minor, currency, account_seq, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, clock_timestamp());
 
 -- name: CloseAccount :exec
 UPDATE accounts SET status = 'closed' WHERE id = $1;
 
 -- name: Statement :many
--- Keyset pagination: "the next page after (created_at, id)". Unlike OFFSET, it costs the same on page 1000 as on
--- page 1, and rows added meanwhile can't shift a page.
-SELECT p.id, p.transaction_id, p.amount_minor, p.currency, p.created_at, t.kind, t.reference
+-- Keyset pagination: "the next page after account_seq n". Unlike OFFSET, it costs the same on page 1000 as on page 1,
+-- and rows added meanwhile can't shift a page. A sequence rather than a timestamp: account_seq is assigned under the
+-- account's lock, so it follows commit order by construction, whatever the clock does.
+SELECT p.id, p.transaction_id, p.amount_minor, p.currency, p.account_seq, p.created_at, t.kind, t.reference
 FROM postings p JOIN transactions t ON t.id = p.transaction_id
-WHERE p.account_id = sqlc.arg(account_id)
-  AND (p.created_at, p.id) > (sqlc.arg(after_created_at)::timestamptz, sqlc.arg(after_id)::uuid)
-ORDER BY p.created_at, p.id
+WHERE p.account_id = sqlc.arg(account_id) AND p.account_seq > sqlc.arg(after_seq)
+ORDER BY p.account_seq
 LIMIT sqlc.arg(page_size);
