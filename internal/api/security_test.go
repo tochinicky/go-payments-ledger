@@ -110,6 +110,7 @@ func TestBadKeyFloodIsAuditedInAggregate(t *testing.T) {
 
 	secret := "sk_flood-" + uuid.NewString()
 	statuses := map[int]int{}
+	began := time.Now()
 	for range 1000 {
 		statuses[client{t: t, key: secret}.send("GET", "/v1/accounts/"+uuid.NewString(), "", "").status]++
 	}
@@ -121,8 +122,9 @@ func TestBadKeyFloodIsAuditedInAggregate(t *testing.T) {
 	if failures != float64(statuses[401]) || throttled != float64(statuses[429]) {
 		t.Errorf("metrics count %v failures and %v throttled, answers were %v", failures, throttled, statuses)
 	}
-	if failures > 100 {
-		t.Errorf("%v bad-key lookups reached the database; the per-address throttle should stop a flood after ~20", failures)
+	// The throttle allows its burst (20), then 10 per second: that bounds the lookups that reach the database.
+	if allowed := 20 + 10*time.Since(began).Seconds() + 5; failures > allowed {
+		t.Errorf("%v bad-key lookups reached the database in %s; the throttle allows at most %.0f", failures, time.Since(began), allowed)
 	}
 
 	if err := apiServer.FlushAudit(ctx); err != nil {

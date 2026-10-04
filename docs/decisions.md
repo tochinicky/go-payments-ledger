@@ -224,4 +224,15 @@ The decisions the build depends on, each with its reason:
   - **7, tenant isolation:** another partner's key gets 404.
   - **8, commit outcome unknown:** Toxiproxy delays Postgres's replies by 700 ms; the moment the database shows the key completed, the proxy is cut, dropping the COMMIT acknowledgement. The client gets 503 and its retry the stored 201, with one transaction. A 500 fails the scenario; only a missed timing window (the acknowledgement got through, so 201) is retried.
   References carry a per-run suffix, so the demo can run again on the same database.
+- **The load test is an open model** (k6 `ramping-arrival-rate`), so a slow server can't lower the request rate and hide its latency (coordinated omission). It reports the SLO from both sides: k6's client-side p99, and ledger-api's own histogram (the share of successful transfers in the 0.1 s bucket). `load/run.sh` takes a CPU profile mid-run (`/debug/pprof` on the admin port only) and runs the reconciliation afterwards. It connects ledger-api straight to Postgres: the demo's Toxiproxy hop isn't part of the service.
+- **SLO missed, stated plainly** (numbers in the README). How it was diagnosed, in order:
+  - **CPU profile:** ledger-api used about half a core, mostly in network syscalls, so it was waiting, not computing.
+  - **Connection pool:** the new pool metrics showed 7 waits in 3,474 acquires, so not the pool.
+  - **Toxiproxy:** bypassing it improved the median, not the tail.
+  - **Commit latency alone:** pgbench in the same container had p99 4.2 ms, with only 0.006% of transactions over 100 ms.
+  - **Postgres wait events under load:** mostly `LWLock:WALWrite` and `IO:WalSync`, then `Lock:transactionid`. Commits queue on the WAL flush, and each transfer holds its row locks across about a dozen round trips, so the queue turns into lock convoys.
+- **The notifier commits once per polled batch** (up to 100 events) instead of once per event. The guarantee is unchanged: the batch's inbox rows and notifications commit together, before the offsets, and a failure redelivers the whole batch. A redelivered event inside one batch is still caught, because the inbox insert sees the batch's own rows. In a 60 s run at 200/s it brought p99 from 8.4 s to 2.5 s and dropped iterations from 3,331 to 858.
+- **Rejected: Postgres group commit (`commit_delay`).** It made things worse (p99 8.5 s): making a commit wait to share a flush while it holds row locks lengthens every lock hold. Durability is not traded away: `synchronous_commit` stays on.
+- **The next step for the SLO** is fewer round trips while the locks are held: send a transfer's statements as one pipelined batch (pgx batches), or move the money movement into one server-side function, so lock hold time stops scaling with network round trips. A real database disk would also change the picture; a laptop VM's virtual disk is the worst case for WAL flushes.
+- **Connection pool metrics** (`db_pool_acquires`, `db_pool_waits`, `db_pool_wait_time_seconds`, `db_pool_in_use`, `db_pool_max`) are exported, since pool starvation is the first thing to rule out in any latency investigation.
 

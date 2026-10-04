@@ -76,7 +76,8 @@ services:
   ledger-api:
     <<: *ledger
     environment:
-      DATABASE_URL: postgres://ledger_app:ledger_app@toxiproxy:15432/ledger?sslmode=disable
+      # Through Toxiproxy by default, for the demo; the load test connects directly (LEDGER_DB_HOST=postgres:5432).
+      DATABASE_URL: postgres://ledger_app:ledger_app@${LEDGER_DB_HOST:-toxiproxy:15432}/ledger?sslmode=disable
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
       SHUTDOWN_DRAIN: 1s
     ports: ["8080:8080", "9090:9090"]

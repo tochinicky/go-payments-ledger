@@ -102,6 +102,9 @@ func run(logger *slog.Logger, args []string) error {
 		return fmt.Errorf("database: %w", err)
 	}
 	defer pool.Close()
+	if err := obs.ObservePool(pool, "app"); err != nil {
+		return err
+	}
 	st := store.New(pool, store.NewID)
 
 	health := &obs.Health{Ready: func(ctx context.Context) error { return st.Ready(ctx, migrations.Version) }}

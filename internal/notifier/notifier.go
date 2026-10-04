@@ -109,12 +109,12 @@ func (n *Notifier) Run(ctx context.Context) error {
 			n.cfg.Log.WarnContext(ctx, "fetch failed", slog.String("topic", topic), slog.Int("partition", int(partition)), slog.Any("error", err))
 		})
 		records := fetches.Records()
-		// A batch already polled is finished even if a stop arrives meanwhile: its transactions and the offset
+		// A batch already polled is finished even if a stop arrives meanwhile: its transaction and the offset
 		// commit run on a context the stop doesn't cancel, so a SIGTERM never leaves a half-done batch to redeliver.
 		batch := context.WithoutCancel(ctx)
-		for _, rec := range records {
-			if err := n.process(batch, rec); err != nil {
-				return fmt.Errorf("event at %s/%d@%d: %w", rec.Topic, rec.Partition, rec.Offset, err)
+		if len(records) > 0 {
+			if err := n.processBatch(batch, records); err != nil {
+				return err
 			}
 		}
 		fault("notifier.after_db_commit")
@@ -128,51 +128,75 @@ func (n *Notifier) Run(ctx context.Context) error {
 	}
 }
 
-// process records one event: inbox row, sequence check and notification, in one transaction.
-func (n *Notifier) process(ctx context.Context, rec *kgo.Record) error {
+// processBatch records a polled batch in one database transaction: each event's inbox row, sequence check and
+// notification. One commit per batch instead of one per event: the commit (its WAL flush) is the expensive part,
+// and the guarantee is the same, since the inbox rows and the notifications still commit together, before the
+// offsets. If anything fails, nothing of the batch is recorded and it is redelivered.
+func (n *Notifier) processBatch(ctx context.Context, records []*kgo.Record) error {
+	var s Stats
+	err := pgx.BeginFunc(ctx, n.cfg.Pool, func(tx pgx.Tx) error {
+		s = Stats{}
+		q := notifierdb.New(tx)
+		for _, rec := range records {
+			if err := n.process(ctx, q, rec, &s); err != nil {
+				return fmt.Errorf("event at %s/%d@%d: %w", rec.Topic, rec.Partition, rec.Offset, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	// Counted only once committed, so a rolled-back batch doesn't count twice when it comes back.
+	n.processed.Add(s.Processed)
+	n.duplicates.Add(s.Duplicates)
+	n.gaps.Add(s.Gaps)
+	n.regressions.Add(s.Regressions)
+	processedTotal.Add(ctx, s.Processed)
+	duplicatesTotal.Add(ctx, s.Duplicates)
+	gapsTotal.Add(ctx, s.Gaps)
+	regressionsTotal.Add(ctx, s.Regressions)
+	return nil
+}
+
+// process records one event inside the batch's transaction: inbox row, sequence check and notification.
+func (n *Notifier) process(ctx context.Context, q *notifierdb.Queries, rec *kgo.Record, s *Stats) error {
 	var e events.Event
 	if err := json.Unmarshal(rec.Value, &e); err != nil {
 		return fmt.Errorf("decode: %w", err)
 	}
-	return pgx.BeginFunc(ctx, n.cfg.Pool, func(tx pgx.Tx) error {
-		q := notifierdb.New(tx)
-		inserted, err := q.InsertInbox(ctx, notifierdb.InsertInboxParams{Consumer: Consumer, EventID: e.EventID})
-		if err != nil {
-			return fmt.Errorf("inbox: %w", err)
-		}
-		if inserted == 0 {
-			n.duplicates.Add(1)
-			duplicatesTotal.Add(ctx, 1)
-			return nil
-		}
-		previous, err := q.LastSeq(ctx, e.AccountID)
-		if errors.Is(err, pgx.ErrNoRows) {
-			previous, err = 0, nil // the account's first event
-		}
-		if err != nil {
-			return fmt.Errorf("progress: %w", err)
-		}
-		if err := q.SetLastSeq(ctx, notifierdb.SetLastSeqParams{AccountID: e.AccountID, LastSeq: e.AccountSeq}); err != nil {
-			return fmt.Errorf("progress: %w", err)
-		}
-		switch {
-		case e.AccountSeq <= previous:
-			n.regressions.Add(1)
-			regressionsTotal.Add(ctx, 1)
-			n.cfg.Log.ErrorContext(ctx, "account_seq went back", slog.String("account", e.AccountID.String()), slog.Int64("seq", e.AccountSeq), slog.Int64("previous", previous))
-		case e.AccountSeq > previous+1:
-			n.gaps.Add(1)
-			gapsTotal.Add(ctx, 1)
-			n.cfg.Log.ErrorContext(ctx, "account_seq skipped ahead", slog.String("account", e.AccountID.String()), slog.Int64("seq", e.AccountSeq), slog.Int64("previous", previous))
-		}
-		if err := q.InsertNotification(ctx, notifierdb.InsertNotificationParams{
-			ID: uuid.Must(uuid.NewV7()), EventID: e.EventID, PartnerID: e.PartnerID, AccountID: e.AccountID,
-			Kind: e.EventType, AmountMinor: e.AmountMinor, AccountSeq: e.AccountSeq,
-		}); err != nil {
-			return fmt.Errorf("notification: %w", err)
-		}
-		n.processed.Add(1)
-		processedTotal.Add(ctx, 1)
+	inserted, err := q.InsertInbox(ctx, notifierdb.InsertInboxParams{Consumer: Consumer, EventID: e.EventID})
+	if err != nil {
+		return fmt.Errorf("inbox: %w", err)
+	}
+	if inserted == 0 {
+		s.Duplicates++
 		return nil
-	})
+	}
+	previous, err := q.LastSeq(ctx, e.AccountID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		previous, err = 0, nil // the account's first event
+	}
+	if err != nil {
+		return fmt.Errorf("progress: %w", err)
+	}
+	if err := q.SetLastSeq(ctx, notifierdb.SetLastSeqParams{AccountID: e.AccountID, LastSeq: e.AccountSeq}); err != nil {
+		return fmt.Errorf("progress: %w", err)
+	}
+	switch {
+	case e.AccountSeq <= previous:
+		s.Regressions++
+		n.cfg.Log.ErrorContext(ctx, "account_seq went back", slog.String("account", e.AccountID.String()), slog.Int64("seq", e.AccountSeq), slog.Int64("previous", previous))
+	case e.AccountSeq > previous+1:
+		s.Gaps++
+		n.cfg.Log.ErrorContext(ctx, "account_seq skipped ahead", slog.String("account", e.AccountID.String()), slog.Int64("seq", e.AccountSeq), slog.Int64("previous", previous))
+	}
+	if err := q.InsertNotification(ctx, notifierdb.InsertNotificationParams{
+		ID: uuid.Must(uuid.NewV7()), EventID: e.EventID, PartnerID: e.PartnerID, AccountID: e.AccountID,
+		Kind: e.EventType, AmountMinor: e.AmountMinor, AccountSeq: e.AccountSeq,
+	}); err != nil {
+		return fmt.Errorf("notification: %w", err)
+	}
+	s.Processed++
+	return nil
 }

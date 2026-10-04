@@ -4,3 +4,5 @@
 *.out
 coverage.*
 .env
+/load/data.json
+/load/results/

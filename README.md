@@ -60,3 +60,36 @@ On SIGTERM, `ledger-api` fails readiness, keeps serving for `SHUTDOWN_DRAIN` (5 
 ## Licence
 
 MIT, see [LICENSE](LICENSE).
+
+## Load test
+
+`load/transfers.js` (k6, an open model: constant arrival rate, so a slow server can't hide its latency by slowing
+the clients) runs 80% transfers and 20% hold place-then-capture across 2 partners and 100 funded accounts, ramped to
+200 requests/s and held for 5 minutes. 5% of writes are retried with the same key: half after the answer (must replay
+byte for byte), half concurrently (a replay or 409, never a second transaction).
+
+```sh
+LEDGER_DB_HOST=postgres:5432 docker compose up -d --build   # the load test bypasses Toxiproxy
+load/setup.sh && load/run.sh                                # RATE and HOLD override 200/s and 5m
+```
+
+**Measured** on one laptop (Apple Silicon, Docker Desktop with 8 vCPUs and 4 GB for the whole stack: Postgres,
+Redpanda, the three services, the observability stack and k6 itself), 2026-10-05:
+
+| | Result |
+|---|---|
+| Correctness | **0 errors** in 67,579 checked requests, **0 replay mismatches**, reconciliation clean |
+| Throughput | **166 iterations/s sustained** of the 200/s offered (k6 dropped the rest) |
+| Transfer latency (k6) | median 16 ms, **p99 5.4 s** |
+| Transfers within 100 ms (ledger-api's own histogram) | **64%** |
+| At 100/s for 60 s | p99 317 ms, nothing dropped |
+
+**SLO verdict: missed.** The target is 99% of `POST /v1/transfers` under 100 ms at 200/s; this machine sustains
+about 166/s and its tail is far above 100 ms even at 100/s. What the investigation found (details in
+[decisions](docs/decisions.md)):
+
+- **The service isn't CPU-bound:** a CPU profile mid-run shows ledger-api using about half a core, mostly in network syscalls.
+- **Postgres's write-ahead log is the bottleneck:** sampled wait events are mostly `WALWrite` and `WalSync` (commits queueing for the log flush), then row-lock waits. Each transfer holds its two balance locks across about a dozen sequential round trips, so slow commits lengthen lock hold times and build convoys.
+- **Done:** the notifier now commits once per batch instead of once per event (p99 at 200/s fell from 8.4 s to 2.5 s in a 60 s run). Postgres group commit (`commit_delay`) was tried and made it worse: waiting to share a flush while holding row locks feeds the convoy.
+- **Next:** fewer round trips while the locks are held (pipelining a transfer's statements), and a real database disk rather than a laptop VM's.
+
