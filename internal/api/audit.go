@@ -55,16 +55,17 @@ func (r *statusRecorder) WriteHeader(status int) {
 // auditWrites records every write attempt with its outcome. A write that ran is audited inside its own
 // transaction (see idempotent), so the money and its audit row commit together; anything else (a validation
 // error, a replay, a 409 in progress, a failure) gets its row here, after the answer.
-// routes resolves a request's route pattern (the mux sets r.Pattern only on the request it hands the handler).
-func (s *Server) auditWrites(routes *http.ServeMux, next http.Handler) http.Handler {
+// It wraps the mux itself, to resolve a request's route pattern (the mux sets r.Pattern only on the request it hands
+// the handler).
+func (s *Server) auditWrites(routes *http.ServeMux) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			next.ServeHTTP(w, r)
+			routes.ServeHTTP(w, r)
 			return
 		}
 		state := &auditState{}
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		next.ServeHTTP(rec, r.WithContext(context.WithValue(r.Context(), auditStateKey{}, state)))
+		routes.ServeHTTP(rec, r.WithContext(context.WithValue(r.Context(), auditStateKey{}, state)))
 		if !state.done {
 			_, pattern := routes.Handler(r)
 			e := auditEntry(r, rec.status)
@@ -87,12 +88,6 @@ func markAudited(r *http.Request) {
 	if state, ok := r.Context().Value(auditStateKey{}).(*auditState); ok {
 		state.done = true
 	}
-}
-
-func (s *Server) auditFailure(r *http.Request, actor string) {
-	s.auditAfter(r, store.AuditEntry{
-		Actor: actor, Action: r.Method + " " + r.URL.Path, Resource: r.URL.Path, Status: http.StatusUnauthorized, RequestID: requestID(r),
-	})
 }
 
 // auditAfter writes an audit row outside any ledger transaction, on a fresh context (the request's may be done).

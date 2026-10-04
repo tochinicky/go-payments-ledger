@@ -3,8 +3,10 @@ package store
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/tochinicky/go-payments-ledger/internal/store/db"
 )
@@ -41,4 +43,29 @@ func (s *Store) Audit(ctx context.Context, e AuditEntry) error {
 		return fmt.Errorf("audit: %w", err)
 	}
 	return nil
+}
+
+// AuditAggregate is many identical outcomes (failed authentications with one key, rate-limited requests of one
+// partner) recorded as one row: how many, and between when.
+type AuditAggregate struct {
+	AuditEntry
+	Count   int
+	FirstAt time.Time
+	LastAt  time.Time
+}
+
+// AuditAggregates records aggregated entries in one transaction.
+func (s *Store) AuditAggregates(ctx context.Context, entries []AuditAggregate) error {
+	return s.inTx(ctx, func(tx Tx) error {
+		for _, e := range entries {
+			if err := tx.q.InsertAuditAggregate(ctx, db.InsertAuditAggregateParams{
+				ID: tx.s.newID(), PartnerID: e.PartnerID, Actor: e.Actor, Action: e.Action, Resource: e.Resource,
+				Status: int32(e.Status), RequestID: e.RequestID, Count: int32(e.Count), //nolint:gosec // small values
+				FirstAt: pgtype.Timestamptz{Time: e.FirstAt, Valid: true}, At: pgtype.Timestamptz{Time: e.LastAt, Valid: true},
+			}); err != nil {
+				return fmt.Errorf("audit aggregate: %w", err)
+			}
+		}
+		return nil
+	})
 }

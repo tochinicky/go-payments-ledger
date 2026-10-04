@@ -95,12 +95,28 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 		writeBody(w, status, body)
 		return
 	}
+	if clientGone(r, err) {
+		// Nobody is listening: no body, a debug line, and status 499 ("client closed request", as nginx records it)
+		// so the metrics show it as its own outcome, outside the error-rate SLO. Never stored, like any 5xx.
+		s.log.DebugContext(r.Context(), "client closed the request", slog.String("method", r.Method), slog.String("path", r.URL.Path))
+		w.WriteHeader(statusClientClosed)
+		return
+	}
 	s.log.ErrorContext(r.Context(), "request failed", slog.String("method", r.Method), slog.String("path", r.URL.Path), slog.Any("error", err))
 	if unavailable(err) {
 		writeProblem(w, "unavailable", "")
 		return
 	}
 	writeProblem(w, "internal", "")
+}
+
+// statusClientClosed is nginx's 499: the client disconnected before the answer. It appears only in metrics.
+const statusClientClosed = 499
+
+// clientGone reports whether the request failed because the client disconnected (its context was cancelled, as
+// opposed to our own deadline, which is DeadlineExceeded and answers 503).
+func clientGone(r *http.Request, err error) bool {
+	return errors.Is(err, context.Canceled) && errors.Is(r.Context().Err(), context.Canceled)
 }
 
 // unavailable reports whether err means the database couldn't be reached, dropped the connection, or didn't answer

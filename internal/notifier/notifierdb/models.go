@@ -29,6 +29,8 @@ type AuditLog struct {
 	Status    int32
 	RequestID string
 	At        pgtype.Timestamptz
+	Count     int32
+	FirstAt   pgtype.Timestamptz
 }
 
 type Balance struct {

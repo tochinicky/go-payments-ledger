@@ -49,6 +49,7 @@ func (s *Server) rateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := partnerOf(r)
 		if ok, wait := s.limiters.allow(p.ID, p.RateLimitPerMin); !ok {
+			s.rateLimited(r, p.ID)
 			w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(wait.Seconds()))))
 			writeProblem(w, "rate_limited", "too many requests for this API key; retry later")
 			return

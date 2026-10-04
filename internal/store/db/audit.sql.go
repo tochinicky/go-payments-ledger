@@ -9,6 +9,7 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const insertAudit = `-- name: InsertAudit :exec
@@ -34,6 +35,40 @@ func (q *Queries) InsertAudit(ctx context.Context, arg InsertAuditParams) error 
 		arg.Resource,
 		arg.Status,
 		arg.RequestID,
+	)
+	return err
+}
+
+const insertAuditAggregate = `-- name: InsertAuditAggregate :exec
+INSERT INTO audit_log (id, partner_id, actor, action, resource, status, request_id, count, first_at, at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+`
+
+type InsertAuditAggregateParams struct {
+	ID        uuid.UUID
+	PartnerID *uuid.UUID
+	Actor     string
+	Action    string
+	Resource  string
+	Status    int32
+	RequestID string
+	Count     int32
+	FirstAt   pgtype.Timestamptz
+	At        pgtype.Timestamptz
+}
+
+func (q *Queries) InsertAuditAggregate(ctx context.Context, arg InsertAuditAggregateParams) error {
+	_, err := q.db.Exec(ctx, insertAuditAggregate,
+		arg.ID,
+		arg.PartnerID,
+		arg.Actor,
+		arg.Action,
+		arg.Resource,
+		arg.Status,
+		arg.RequestID,
+		arg.Count,
+		arg.FirstAt,
+		arg.At,
 	)
 	return err
 }

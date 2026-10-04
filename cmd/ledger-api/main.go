@@ -106,9 +106,10 @@ func run(logger *slog.Logger, args []string) error {
 
 	health := &obs.Health{Ready: func(ctx context.Context) error { return st.Ready(ctx, migrations.Version) }}
 	admin := &http.Server{Addr: envOr("ADMIN_ADDR", ":9090"), Handler: telemetry.AdminHandler(health), ReadHeaderTimeout: 5 * time.Second}
+	apiServer := api.New(api.Config{Store: st, Log: logger, RequestTimeout: timeouts.Request, MaxAmountMinor: maxAmount})
 	srv := &http.Server{
 		Addr:              envOr("LISTEN_ADDR", ":8080"),
-		Handler:           api.New(api.Config{Store: st, Log: logger, RequestTimeout: timeouts.Request, MaxAmountMinor: maxAmount}).Handler(),
+		Handler:           apiServer.Handler(),
 		ReadHeaderTimeout: 5 * time.Second, // a client can't hold a connection open by sending headers slowly
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      timeouts.Request + 5*time.Second, // the handler's own deadline ends it first
@@ -120,6 +121,7 @@ func run(logger *slog.Logger, args []string) error {
 	var wg sync.WaitGroup
 	wg.Go(func() { cleanupKeys(loops, logger, st, retention) })
 	wg.Go(func() { expireHolds(loops, logger, st) })
+	wg.Go(func() { apiServer.RunAuditFlush(loops, time.Minute) }) // aggregated refusals; flushed once more on stop
 
 	errc := make(chan error, 2)
 	go func() { errc <- admin.ListenAndServe() }()

@@ -44,6 +44,8 @@ type Server struct {
 	requestTimeout time.Duration
 	maxAmount      int64
 	limiters       *limiters
+	failedAuth     *failedAuth
+	abuse          *abuse
 }
 
 // New returns a server.
@@ -53,11 +55,13 @@ func New(cfg Config) *Server {
 	}
 	return &Server{
 		store: cfg.Store, log: cfg.Log, requestTimeout: cfg.RequestTimeout, maxAmount: cfg.MaxAmountMinor, limiters: newLimiters(),
+		failedAuth: newFailedAuth(), abuse: newAbuse(cfg.Log),
 	}
 }
 
-// Handler returns the routes. Every request gets a request id and a deadline, then must authenticate (failures are
-// audited); every write is audited with its outcome, including a refusal by the per-partner rate limit.
+// Handler returns the routes. Every request gets a request id and a deadline, then must authenticate, then passes
+// the partner's rate limit; every write that gets that far is audited with its outcome. Authentication failures and
+// rate-limited requests are audited in aggregate (see abuse.go).
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	for pattern, h := range map[string]http.HandlerFunc{
@@ -73,7 +77,7 @@ func (s *Server) Handler() http.Handler {
 	} {
 		mux.Handle(pattern, route(pattern, h))
 	}
-	chain := withRequestID(s.withDeadline(s.authenticate(s.auditWrites(mux, s.rateLimit(mux)))))
+	chain := withRequestID(s.withDeadline(s.authenticate(s.rateLimit(s.auditWrites(mux)))))
 	// Outermost, so the latency histogram (http.server.request.duration) and the trace span cover everything,
 	// including authentication and rate limiting.
 	return otelhttp.NewHandler(chain, "ledger-api")
@@ -113,9 +117,15 @@ type partnerKey struct{}
 // at most a short fingerprint of the key's hash: never the key.
 func (s *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.failedAuth.blocked(r) { // a flood of bad keys never reaches the database
+			s.authThrottled(r)
+			w.Header().Set("Retry-After", "1")
+			writeProblem(w, "rate_limited", "too many failed authentications from this address; retry later")
+			return
+		}
 		key, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if !ok || key == "" {
-			s.auditFailure(r, "anonymous")
+			s.authFailure(r, "anonymous")
 			writeProblem(w, "unauthenticated", "an API key is required: Authorization: Bearer <key>")
 			return
 		}
@@ -126,7 +136,7 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			return
 		}
 		if !found {
-			s.auditFailure(r, "key:"+hex.EncodeToString(hash[:4]))
+			s.authFailure(r, "key:"+hex.EncodeToString(hash[:4]))
 			writeProblem(w, "unauthenticated", "unknown API key")
 			return
 		}

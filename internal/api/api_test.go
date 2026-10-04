@@ -25,6 +25,7 @@ import (
 var (
 	tdb       *testdb.DB
 	srv       *httptest.Server
+	apiServer *api.Server
 	telemetry *obs.Telemetry
 )
 
@@ -34,7 +35,8 @@ func TestMain(m *testing.M) {
 		if telemetry, err = obs.Setup(context.Background(), "ledger-api-test"); err != nil {
 			panic(err)
 		}
-		srv = httptest.NewServer(api.New(api.Config{Store: store.New(tdb.App, store.NewID), Log: slog.New(slog.DiscardHandler), RequestTimeout: store.DefaultTimeouts.Request}).Handler())
+		apiServer = api.New(api.Config{Store: store.New(tdb.App, store.NewID), Log: slog.New(slog.DiscardHandler), RequestTimeout: store.DefaultTimeouts.Request})
+		srv = httptest.NewServer(apiServer.Handler())
 	}))
 }
 

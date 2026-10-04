@@ -4,10 +4,15 @@ import (
 	"bytes"
 	"context"
 	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/tochinicky/go-payments-ledger/internal/obs"
 )
 
 type auditRow struct {
@@ -70,20 +75,87 @@ func TestWritesAreAudited(t *testing.T) {
 	}
 }
 
-// An authentication failure is audited without the key: only a short fingerprint of its hash.
-func TestAuthFailuresAreAuditedWithoutTheKey(t *testing.T) {
-	secret := "sk_this-key-does-not-exist-" + uuid.NewString()
-	resp := client{t: t, key: secret}.send("GET", "/v1/accounts/"+uuid.NewString(), "", "")
-	if resp.status != http.StatusUnauthorized {
-		t.Fatalf("status %d", resp.status)
+// metricValue reads one counter from the Prometheus exposition (0 if it isn't there yet).
+func metricValue(t *testing.T, name string) float64 {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	telemetry.AdminHandler(&obs.Health{}).ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), "GET", "/metrics", nil))
+	var total float64
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		if strings.HasPrefix(line, name+" ") || strings.HasPrefix(line, name+"{") {
+			f := strings.Fields(line)
+			v, err := strconv.ParseFloat(f[len(f)-1], 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			total += v
+		}
 	}
-	rows := auditRows(t, "request_id = $1", resp.header.Get("X-Request-Id"))
-	if len(rows) != 1 || rows[0].partner != nil || rows[0].status != 401 || !strings.HasPrefix(rows[0].actor, "key:") {
-		t.Fatalf("audit rows = %+v", rows)
+	return total
+}
+
+// We audit abuse in aggregate: a flood of 1,000 bad-key requests makes a handful of audit rows (one per key and
+// outcome per flush), never one per request, and only the first few even reach the database: after that, the
+// address is throttled before any lookup. The key itself is never recorded: only a short fingerprint of its hash.
+func TestBadKeyFloodIsAuditedInAggregate(t *testing.T) {
+	ctx := context.Background()
+	if err := apiServer.FlushAudit(ctx); err != nil { // start from an empty aggregate
+		t.Fatal(err)
 	}
-	if strings.Contains(rows[0].actor, secret) || len(rows[0].actor) > len("key:")+8 {
-		t.Errorf("actor %q carries more than a fingerprint", rows[0].actor)
+	var before int
+	if err := tdb.Owner.QueryRow(ctx, "SELECT count(*) FROM audit_log").Scan(&before); err != nil {
+		t.Fatal(err)
 	}
+	failuresBefore, throttledBefore := metricValue(t, "ledger_auth_failures_total"), metricValue(t, "ledger_auth_throttled_total")
+
+	secret := "sk_flood-" + uuid.NewString()
+	statuses := map[int]int{}
+	for range 1000 {
+		statuses[client{t: t, key: secret}.send("GET", "/v1/accounts/"+uuid.NewString(), "", "").status]++
+	}
+	if statuses[401]+statuses[429] != 1000 || statuses[429] == 0 {
+		t.Fatalf("answers %v: want only 401s, then 429s once the address is throttled", statuses)
+	}
+	failures := metricValue(t, "ledger_auth_failures_total") - failuresBefore
+	throttled := metricValue(t, "ledger_auth_throttled_total") - throttledBefore
+	if failures != float64(statuses[401]) || throttled != float64(statuses[429]) {
+		t.Errorf("metrics count %v failures and %v throttled, answers were %v", failures, throttled, statuses)
+	}
+	if failures > 100 {
+		t.Errorf("%v bad-key lookups reached the database; the per-address throttle should stop a flood after ~20", failures)
+	}
+
+	if err := apiServer.FlushAudit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := tdb.Owner.Query(ctx, "SELECT actor, action, status, count FROM audit_log ORDER BY at DESC LIMIT 10")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	counted := map[string]int{}
+	for rows.Next() {
+		var actor, action string
+		var status, count int
+		if err := rows.Scan(&actor, &action, &status, &count); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(actor, secret) {
+			t.Errorf("audit actor %q carries the key", actor)
+		}
+		counted[action] += count
+	}
+	var after int
+	if err := tdb.Owner.QueryRow(ctx, "SELECT count(*) FROM audit_log").Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after-before > 3 {
+		t.Errorf("%d audit rows for the flood, want at most a handful", after-before)
+	}
+	if counted["auth_failure"] != statuses[401] || counted["auth_throttled"] != statuses[429] {
+		t.Errorf("aggregated counts %v, answers %v", counted, statuses)
+	}
+	time.Sleep(2 * time.Second) // let this address's failure bucket refill before other tests use it
 }
 
 // The audit log is append-only, like postings: the app can't change it, and the trigger stops even the owner.
@@ -143,10 +215,20 @@ func TestRateLimitIsPerPartner(t *testing.T) {
 	if status, _ := other.do("GET", "/v1/accounts/"+other.settlement.String(), ""); status != http.StatusOK {
 		t.Errorf("another partner was limited too: %d", status)
 	}
-	// A refused write is still audited.
-	resp = slow.send("POST", "/v1/accounts", `{"currency":"EUR"}`, uuid.NewString())
-	if rows := auditRows(t, "request_id = $1", resp.header.Get("X-Request-Id")); resp.status != 429 || len(rows) != 1 || rows[0].status != 429 {
-		t.Errorf("rate-limited write: %d, audit %+v", resp.status, rows)
+	// Rate-limited requests are audited in aggregate: one row for the partner with the count.
+	for range 5 {
+		slow.send("POST", "/v1/accounts", `{"currency":"EUR"}`, uuid.NewString())
+	}
+	if err := apiServer.FlushAudit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var rows, count int
+	if err := tdb.Owner.QueryRow(ctx, "SELECT count(*), coalesce(sum(count), 0) FROM audit_log WHERE partner_id = $1 AND action = 'rate_limited'",
+		slow.partner).Scan(&rows, &count); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 || count != 6 { // the GET and the 5 writes
+		t.Errorf("%d rate_limited rows counting %d, want 1 row counting 6", rows, count)
 	}
 }
 
