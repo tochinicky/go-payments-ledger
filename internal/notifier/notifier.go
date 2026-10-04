@@ -17,10 +17,29 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/tochinicky/go-payments-ledger/internal/events"
 	"github.com/tochinicky/go-payments-ledger/internal/notifier/notifierdb"
 )
+
+var meter = otel.Meter("github.com/tochinicky/go-payments-ledger/internal/notifier")
+
+// The stream's health as metrics: gaps and regressions must stay at zero.
+var (
+	processedTotal   = must(meter.Int64Counter("notifier.processed", metric.WithDescription("Events turned into notifications.")))
+	duplicatesTotal  = must(meter.Int64Counter("notifier.duplicates", metric.WithDescription("Redeliveries skipped by the inbox.")))
+	gapsTotal        = must(meter.Int64Counter("notifier.gaps", metric.WithDescription("Events whose account_seq skipped ahead.")))
+	regressionsTotal = must(meter.Int64Counter("notifier.regressions", metric.WithDescription("Events whose account_seq went back.")))
+)
+
+func must[T any](v T, err error) T {
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
 
 // Consumer is the inbox's consumer name and the Kafka consumer group.
 const Consumer = "notifier"
@@ -90,14 +109,17 @@ func (n *Notifier) Run(ctx context.Context) error {
 			n.cfg.Log.WarnContext(ctx, "fetch failed", slog.String("topic", topic), slog.Int("partition", int(partition)), slog.Any("error", err))
 		})
 		records := fetches.Records()
+		// A batch already polled is finished even if a stop arrives meanwhile: its transactions and the offset
+		// commit run on a context the stop doesn't cancel, so a SIGTERM never leaves a half-done batch to redeliver.
+		batch := context.WithoutCancel(ctx)
 		for _, rec := range records {
-			if err := n.process(ctx, rec); err != nil {
+			if err := n.process(batch, rec); err != nil {
 				return fmt.Errorf("event at %s/%d@%d: %w", rec.Topic, rec.Partition, rec.Offset, err)
 			}
 		}
 		fault("notifier.after_db_commit")
 		if len(records) > 0 {
-			if err := cl.CommitRecords(ctx, records...); err != nil && ctx.Err() == nil {
+			if err := cl.CommitRecords(batch, records...); err != nil {
 				// Not fatal: the events are already recorded, and a redelivery is absorbed by the inbox.
 				n.cfg.Log.WarnContext(ctx, "offset commit failed", slog.Any("error", err))
 			}
@@ -120,6 +142,7 @@ func (n *Notifier) process(ctx context.Context, rec *kgo.Record) error {
 		}
 		if inserted == 0 {
 			n.duplicates.Add(1)
+			duplicatesTotal.Add(ctx, 1)
 			return nil
 		}
 		previous, err := q.LastSeq(ctx, e.AccountID)
@@ -135,9 +158,11 @@ func (n *Notifier) process(ctx context.Context, rec *kgo.Record) error {
 		switch {
 		case e.AccountSeq <= previous:
 			n.regressions.Add(1)
+			regressionsTotal.Add(ctx, 1)
 			n.cfg.Log.ErrorContext(ctx, "account_seq went back", slog.String("account", e.AccountID.String()), slog.Int64("seq", e.AccountSeq), slog.Int64("previous", previous))
 		case e.AccountSeq > previous+1:
 			n.gaps.Add(1)
+			gapsTotal.Add(ctx, 1)
 			n.cfg.Log.ErrorContext(ctx, "account_seq skipped ahead", slog.String("account", e.AccountID.String()), slog.Int64("seq", e.AccountSeq), slog.Int64("previous", previous))
 		}
 		if err := q.InsertNotification(ctx, notifierdb.InsertNotificationParams{
@@ -147,6 +172,7 @@ func (n *Notifier) process(ctx context.Context, rec *kgo.Record) error {
 			return fmt.Errorf("notification: %w", err)
 		}
 		n.processed.Add(1)
+		processedTotal.Add(ctx, 1)
 		return nil
 	})
 }

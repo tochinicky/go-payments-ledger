@@ -17,17 +17,23 @@ import (
 
 	"github.com/tochinicky/go-payments-ledger/internal/api"
 	"github.com/tochinicky/go-payments-ledger/internal/ledger"
+	"github.com/tochinicky/go-payments-ledger/internal/obs"
 	"github.com/tochinicky/go-payments-ledger/internal/store"
 	"github.com/tochinicky/go-payments-ledger/internal/testdb"
 )
 
 var (
-	tdb *testdb.DB
-	srv *httptest.Server
+	tdb       *testdb.DB
+	srv       *httptest.Server
+	telemetry *obs.Telemetry
 )
 
 func TestMain(m *testing.M) {
 	os.Exit(testdb.Run(m, &tdb, func() {
+		var err error
+		if telemetry, err = obs.Setup(context.Background(), "ledger-api-test"); err != nil {
+			panic(err)
+		}
 		srv = httptest.NewServer(api.New(api.Config{Store: store.New(tdb.App, store.NewID), Log: slog.New(slog.DiscardHandler), RequestTimeout: store.DefaultTimeouts.Request}).Handler())
 	}))
 }

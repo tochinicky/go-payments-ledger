@@ -1,8 +1,9 @@
 // Command notifier consumes the ledger's events and records one notification per event.
 //
-//	DATABASE_URL              the notifier's own login role
-//	KAFKA_BROKERS             comma-separated seed brokers
-//	SESSION_TIMEOUT           how soon the group notices a crashed member (a Go duration, default 45s)
+//	DATABASE_URL       the notifier's own login role
+//	KAFKA_BROKERS      comma-separated seed brokers
+//	SESSION_TIMEOUT    how soon the group notices a crashed member (a Go duration, default 45s)
+//	ADMIN_ADDR         /metrics and /healthz (default :9092); notifier_gaps and notifier_regressions must stay at 0
 package main
 
 import (
@@ -10,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -19,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/tochinicky/go-payments-ledger/internal/notifier"
+	"github.com/tochinicky/go-payments-ledger/internal/obs"
 )
 
 func main() {
@@ -43,12 +46,30 @@ func run(logger *slog.Logger) error {
 			return fmt.Errorf("SESSION_TIMEOUT %q: %w", v, err)
 		}
 	}
+	telemetry, err := obs.Setup(ctx, "notifier")
+	if err != nil {
+		return err
+	}
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return fmt.Errorf("database: %w", err)
 	}
 	defer pool.Close()
-	return notifier.New(notifier.Config{
+	admin := &http.Server{Addr: envOr("ADMIN_ADDR", ":9092"), Handler: telemetry.AdminHandler(&obs.Health{}), ReadHeaderTimeout: 5 * time.Second}
+	go func() { _ = admin.ListenAndServe() }()
+
+	// On SIGTERM the loop finishes its batch, commits, leaves the group (so its partitions move at once) and returns.
+	err = notifier.New(notifier.Config{
 		Pool: pool, Brokers: strings.Split(brokers, ","), SessionTimeout: session, Log: logger,
 	}).Run(ctx)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return errors.Join(err, admin.Shutdown(shutdownCtx), telemetry.Shutdown(shutdownCtx))
+}
+
+func envOr(name, fallback string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return fallback
 }

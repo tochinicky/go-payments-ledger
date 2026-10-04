@@ -15,6 +15,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/tochinicky/go-payments-ledger/internal/store"
 )
@@ -57,16 +60,39 @@ func New(cfg Config) *Server {
 // audited); every write is audited with its outcome, including a refusal by the per-partner rate limit.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/accounts", s.openAccount)
-	mux.HandleFunc("GET /v1/accounts/{id}", s.getAccount)
-	mux.HandleFunc("GET /v1/accounts/{id}/balance", s.getBalance)
-	mux.HandleFunc("GET /v1/accounts/{id}/statement", s.getStatement)
-	mux.HandleFunc("POST /v1/transfers", s.createTransfer)
-	mux.HandleFunc("POST /v1/holds", s.placeHold)
-	mux.HandleFunc("GET /v1/holds/{id}", s.getHold)
-	mux.HandleFunc("POST /v1/holds/{id}/capture", s.captureHold)
-	mux.HandleFunc("POST /v1/holds/{id}/release", s.releaseHold)
-	return withRequestID(s.withDeadline(s.authenticate(s.auditWrites(mux, s.rateLimit(mux)))))
+	for pattern, h := range map[string]http.HandlerFunc{
+		"POST /v1/accounts":               s.openAccount,
+		"GET /v1/accounts/{id}":           s.getAccount,
+		"GET /v1/accounts/{id}/balance":   s.getBalance,
+		"GET /v1/accounts/{id}/statement": s.getStatement,
+		"POST /v1/transfers":              s.createTransfer,
+		"POST /v1/holds":                  s.placeHold,
+		"GET /v1/holds/{id}":              s.getHold,
+		"POST /v1/holds/{id}/capture":     s.captureHold,
+		"POST /v1/holds/{id}/release":     s.releaseHold,
+	} {
+		mux.Handle(pattern, route(pattern, h))
+	}
+	chain := withRequestID(s.withDeadline(s.authenticate(s.auditWrites(mux, s.rateLimit(mux)))))
+	// Outermost, so the latency histogram (http.server.request.duration) and the trace span cover everything,
+	// including authentication and rate limiting.
+	return otelhttp.NewHandler(chain, "ledger-api")
+}
+
+// route labels a request's span and its latency metrics with the route pattern ("POST /v1/transfers"), not the
+// path, so metrics stay one series per route. (otelhttp can't see the pattern itself: the mux sets it on the
+// request copy it hands the handler.)
+func route(pattern string, h http.Handler) http.Handler {
+	attr := semconv.HTTPRoute(pattern)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if labeler, ok := otelhttp.LabelerFromContext(r.Context()); ok {
+			labeler.Add(attr)
+		}
+		span := trace.SpanFromContext(r.Context())
+		span.SetName(pattern)
+		span.SetAttributes(attr)
+		h.ServeHTTP(w, r)
+	})
 }
 
 // withDeadline gives each request a context deadline. pgx cancels a query when its context ends, so a request stuck

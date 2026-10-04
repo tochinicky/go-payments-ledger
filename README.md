@@ -49,6 +49,12 @@ DATABASE_URL=... KAFKA_BROKERS=localhost:9092 notifier          # the notifier's
 
 The end-to-end tests (`internal/e2e`) run the pipeline against real Postgres and Redpanda containers, including crash and outage scenarios.
 
+## Operations
+
+Each binary has an admin listener apart from its main port: `ledger-api` on `:9090`, `relay` on `:9091`, `notifier` on `:9092` (`ADMIN_ADDR`). It serves `/metrics` (Prometheus), `/healthz` (liveness: the process is up) and `/readyz` (readiness; for `ledger-api`, the database answers and its schema is at least this build's migration version). Traces go to `OTEL_EXPORTER_OTLP_ENDPOINT` when it is set.
+
+On SIGTERM, `ledger-api` fails readiness, keeps serving for `SHUTDOWN_DRAIN` (5 s), then stops accepting and lets in-flight requests finish. The relay stops within `SHUTDOWN_TIMEOUT` (15 s) even if Kafka is unreachable. Every write and every authentication failure is recorded in `audit_log`; each partner is rate-limited by its `rate_limit_per_min`.
+
 - [Decisions](docs/decisions.md)
 
 ## Licence

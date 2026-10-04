@@ -64,7 +64,8 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// buildFaultinjectBinaries builds the relay and the notifier with their crash points compiled in.
+// buildFaultinjectBinaries builds the relay and the notifier with their crash points compiled in, and ledger-api
+// and relay as production builds (for the shutdown tests, as "<cmd>-prod").
 func buildFaultinjectBinaries() (string, error) {
 	dir, err := os.MkdirTemp("", "e2e-bin")
 	if err != nil {
@@ -76,12 +77,18 @@ func buildFaultinjectBinaries() (string, error) {
 		return "", err
 	}
 	root := filepath.Dir(strings.TrimSpace(string(gomod)))
-	for _, cmd := range []string{"relay", "notifier"} {
-		build := exec.CommandContext(ctx, "go", "build", "-tags", "faultinject", "-o", filepath.Join(dir, cmd), "./cmd/"+cmd) //nolint:gosec // fixed arguments
+	builds := [][]string{
+		{"-tags", "faultinject", "-o", filepath.Join(dir, "relay"), "./cmd/relay"},
+		{"-tags", "faultinject", "-o", filepath.Join(dir, "notifier"), "./cmd/notifier"},
+		{"-o", filepath.Join(dir, "ledger-api-prod"), "./cmd/ledger-api"},
+		{"-o", filepath.Join(dir, "relay-prod"), "./cmd/relay"},
+	}
+	for _, args := range builds {
+		build := exec.CommandContext(ctx, "go", append([]string{"build"}, args...)...) //nolint:gosec // fixed arguments
 
 		build.Dir = root
 		if out, err := build.CombinedOutput(); err != nil {
-			return "", fmt.Errorf("build %s: %w\n%s", cmd, err, out)
+			return "", fmt.Errorf("build %v: %w\n%s", args, err, out)
 		}
 	}
 	return dir, nil
@@ -225,6 +232,14 @@ func eventually(t *testing.T, within time.Duration, what string, cond func() boo
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// waitPublished waits until every one of the partner's events is published.
+func (p partner) waitPublished(t *testing.T) {
+	t.Helper()
+	eventually(t, 60*time.Second, "not every event was published", func() bool {
+		return p.count(t, "SELECT count(*) FROM outbox WHERE partner_id = $1 AND published_at IS NULL") == 0
+	})
 }
 
 // waitDelivered waits until every one of the partner's events is published and notified.

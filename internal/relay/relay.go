@@ -12,10 +12,26 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/tochinicky/go-payments-ledger/internal/events"
 	"github.com/tochinicky/go-payments-ledger/internal/relay/relaydb"
 )
+
+var (
+	meter          = otel.Meter("github.com/tochinicky/go-payments-ledger/internal/relay")
+	publishedTotal = must(meter.Int64Counter("relay.published", metric.WithDescription("Outbox events Kafka acknowledged.")))
+	failedTotal    = must(meter.Int64Counter("relay.failed", metric.WithDescription("Outbox events Kafka refused (sent again later).")))
+	leading        = must(meter.Int64UpDownCounter("relay.leader", metric.WithDescription("1 while this relay holds the lock.")))
+)
+
+func must[T any](v T, err error) T {
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
 
 // lockKey is the advisory lock that elects the active relay.
 const lockKey int64 = 0x6c65646765725f72 // "ledger_r"
@@ -74,6 +90,8 @@ func session(ctx context.Context, cfg Config) error {
 		}
 		if leader {
 			cfg.Log.InfoContext(ctx, "relay is the leader")
+			leading.Add(ctx, 1)
+			defer leading.Add(context.WithoutCancel(ctx), -1)
 			return lead(ctx, cfg, relaydb.New(conn))
 		}
 		if !sleep(ctx, cfg.Retry) {
@@ -129,8 +147,10 @@ func publish(ctx context.Context, cfg Config, q *relaydb.Queries) (published, fa
 		}
 		acked = append(acked, rows[i].ID)
 	}
+	publishedTotal.Add(ctx, int64(len(acked)))
+	failedTotal.Add(ctx, int64(failed))
 	if len(acked) > 0 {
-		if err := q.MarkPublished(ctx, acked); err != nil {
+		if err := q.MarkPublished(context.WithoutCancel(ctx), acked); err != nil {
 			return 0, failed, fmt.Errorf("mark published: %w", err)
 		}
 	}

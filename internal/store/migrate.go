@@ -25,3 +25,25 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 	return nil
 }
+
+// SchemaVersion returns the newest applied migration, as the app role sees it (0 if none).
+func (s *Store) SchemaVersion(ctx context.Context) (int64, error) {
+	var v int64
+	if err := s.pool.QueryRow(ctx, "SELECT coalesce(max(version_id), 0) FROM goose_db_version WHERE is_applied").Scan(&v); err != nil {
+		return 0, fmt.Errorf("schema version: %w", err)
+	}
+	return v, nil
+}
+
+// Ready reports whether the database answers and its schema has reached want, so a replica never takes traffic
+// for a schema its code doesn't expect. A newer schema is fine (migrations are additive during a rollout).
+func (s *Store) Ready(ctx context.Context, want int64) error {
+	v, err := s.SchemaVersion(ctx)
+	if err != nil {
+		return err
+	}
+	if v < want {
+		return fmt.Errorf("schema at migration %d, this build needs %d", v, want)
+	}
+	return nil
+}
