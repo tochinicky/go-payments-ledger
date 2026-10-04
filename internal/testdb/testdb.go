@@ -72,6 +72,7 @@ func open(ctx context.Context, container *postgres.PostgresContainer) (*DB, erro
 	}
 	appCfg.ConnConfig.User, appCfg.ConnConfig.Password = "ledger_app", "app"
 	appCfg.MaxConns = 20
+	store.DefaultTimeouts.Apply(appCfg) // the same bounds as production
 	app, err := pgxpool.NewWithConfig(ctx, appCfg)
 	if err != nil {
 		return nil, err

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -22,13 +23,14 @@ const maxBodyBytes = 64 << 10
 
 // Server serves the API from a store.
 type Server struct {
-	store *store.Store
-	log   *slog.Logger
+	store          *store.Store
+	log            *slog.Logger
+	requestTimeout time.Duration
 }
 
-// New returns a server.
-func New(st *store.Store, log *slog.Logger) *Server {
-	return &Server{store: st, log: log}
+// New returns a server. requestTimeout is every request's deadline (store.Timeouts.Request).
+func New(st *store.Store, log *slog.Logger, requestTimeout time.Duration) *Server {
+	return &Server{store: st, log: log, requestTimeout: requestTimeout}
 }
 
 // Handler returns the routes, every one behind authentication.
@@ -39,7 +41,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/accounts/{id}/balance", s.getBalance)
 	mux.HandleFunc("GET /v1/accounts/{id}/statement", s.getStatement)
 	mux.HandleFunc("POST /v1/transfers", s.createTransfer)
-	return s.authenticate(mux)
+	return s.withDeadline(s.authenticate(mux))
+}
+
+// withDeadline gives each request a context deadline. pgx cancels a query when its context ends, so a request stuck
+// on the database is stopped, not merely abandoned (http.Server's WriteTimeout doesn't cancel the handler).
+func (s *Server) withDeadline(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), s.requestTimeout)
+		defer cancel()
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 type partnerKey struct{}

@@ -5,8 +5,11 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/tochinicky/go-payments-ledger/internal/store"
 )
 
 func (c client) transactions(t *testing.T) int {
@@ -168,5 +171,49 @@ func TestRetryStorm(t *testing.T) {
 	}
 	if got := c.transactions(t); got != 1 {
 		t.Errorf("%d transactions, want exactly 1", got)
+	}
+}
+
+// A request stuck behind a lock gives up at lock_timeout, well inside its lease: 503 with Retry-After, nothing
+// stored, the key freed. Once the lock is gone, a retry with the same key runs and succeeds.
+func TestLockTimeoutIs503AndFreesTheKey(t *testing.T) {
+	ctx := context.Background()
+	c := newClient(t, 1_000)
+	alice := c.openAccount()
+	key, body := uuid.NewString(), transferBody(c.settlement.String(), alice, 10)
+
+	blocker, err := tdb.Owner.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Rollback(ctx) }()
+	if _, err := blocker.Exec(ctx, "SELECT 1 FROM balances WHERE account_id = $1 FOR UPDATE", c.settlement); err != nil {
+		t.Fatal(err)
+	}
+	began := time.Now()
+	resp := c.send("POST", "/v1/transfers", body, key)
+	took := time.Since(began)
+	if resp.status != http.StatusServiceUnavailable || !bytes.Contains(resp.body, []byte(`"unavailable"`)) || resp.header.Get("Retry-After") != "1" {
+		t.Fatalf("behind the lock: %d %s, Retry-After %q", resp.status, resp.body, resp.header.Get("Retry-After"))
+	}
+	if lock := store.DefaultTimeouts.Lock; took < lock || took > lock+2*time.Second {
+		t.Errorf("gave up after %s, want about the lock timeout (%s)", took, lock)
+	}
+	var keys int
+	if err := tdb.Owner.QueryRow(ctx, "SELECT count(*) FROM idempotency WHERE key = $1", key).Scan(&keys); err != nil {
+		t.Fatal(err)
+	}
+	if keys != 0 {
+		t.Errorf("the failed attempt left its key claimed")
+	}
+
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if resp := c.send("POST", "/v1/transfers", body, key); resp.status != http.StatusCreated {
+		t.Fatalf("retry after the lock is gone: %d %s", resp.status, resp.body)
+	}
+	if n := c.transactions(t); n != 1 {
+		t.Errorf("%d transactions, want 1", n)
 	}
 }

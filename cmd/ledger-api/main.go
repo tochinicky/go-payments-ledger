@@ -4,6 +4,8 @@
 //	ledger-api migrate   apply the migrations, connecting with DATABASE_URL as the owner role
 //
 // IDEMPOTENCY_RETENTION (a Go duration, default 24h) is how long completed idempotency keys are kept.
+// REQUEST_TIMEOUT, STATEMENT_TIMEOUT and LOCK_TIMEOUT (defaults 10s, 8s, 5s) bound each request; ledger-api refuses
+// to start unless idempotency lease (30s) > request > statement ≥ lock.
 package main
 
 import (
@@ -39,15 +41,38 @@ func run(logger *slog.Logger, args []string) error {
 	if dsn == "" {
 		return errors.New("DATABASE_URL is not set")
 	}
-	pool, err := pgxpool.New(ctx, dsn)
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return fmt.Errorf("DATABASE_URL: %w", err)
+	}
+	if len(args) > 0 && args[0] == "migrate" { // migrations run without the request timeouts
+		pool, err := pgxpool.NewWithConfig(ctx, cfg)
+		if err != nil {
+			return fmt.Errorf("database: %w", err)
+		}
+		defer pool.Close()
+		return store.Migrate(ctx, pool)
+	}
+
+	timeouts := store.DefaultTimeouts
+	for name, d := range map[string]*time.Duration{
+		"REQUEST_TIMEOUT": &timeouts.Request, "STATEMENT_TIMEOUT": &timeouts.Statement, "LOCK_TIMEOUT": &timeouts.Lock,
+	} {
+		if v := os.Getenv(name); v != "" {
+			if *d, err = time.ParseDuration(v); err != nil {
+				return fmt.Errorf("%s %q: %w", name, v, err)
+			}
+		}
+	}
+	if err := timeouts.Validate(); err != nil {
+		return err
+	}
+	timeouts.Apply(cfg)
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("database: %w", err)
 	}
 	defer pool.Close()
-
-	if len(args) > 0 && args[0] == "migrate" {
-		return store.Migrate(ctx, pool)
-	}
 	retention := 24 * time.Hour
 	if v := os.Getenv("IDEMPOTENCY_RETENTION"); v != "" {
 		if retention, err = time.ParseDuration(v); err != nil || retention <= 0 {
@@ -63,10 +88,10 @@ func run(logger *slog.Logger, args []string) error {
 	}
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           api.New(st, logger).Handler(),
+		Handler:           api.New(st, logger, timeouts.Request).Handler(),
 		ReadHeaderTimeout: 5 * time.Second, // a client can't hold a connection open by sending headers slowly
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      timeouts.Request + 5*time.Second, // the handler's own deadline ends it first
 		IdleTimeout:       2 * time.Minute,
 	}
 	errc := make(chan error, 1)

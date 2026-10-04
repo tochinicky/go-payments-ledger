@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -96,11 +97,16 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	writeProblem(w, "internal", "")
 }
 
-// unavailable reports whether err means the database couldn't be reached or didn't answer in time, rather than a bug.
+// unavailable reports whether err means the database couldn't be reached or didn't answer in time (a connection
+// failure, the request's deadline, statement_timeout or lock_timeout), rather than a bug. All are worth retrying.
 func unavailable(err error) bool {
 	var netErr net.Error
 	var connectErr *pgconn.ConnectError
-	return errors.As(err, &netErr) || errors.As(err, &connectErr) || pgconn.Timeout(err)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && (pgErr.Code == "55P03" || pgErr.Code == "57014") { // lock_not_available, query_canceled
+		return true
+	}
+	return errors.As(err, &netErr) || errors.As(err, &connectErr) || pgconn.Timeout(err) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

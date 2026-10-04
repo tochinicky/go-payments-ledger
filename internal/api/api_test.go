@@ -28,7 +28,7 @@ var (
 
 func TestMain(m *testing.M) {
 	os.Exit(testdb.Run(m, &tdb, func() {
-		srv = httptest.NewServer(api.New(store.New(tdb.App, store.NewID), slog.New(slog.DiscardHandler)).Handler())
+		srv = httptest.NewServer(api.New(store.New(tdb.App, store.NewID), slog.New(slog.DiscardHandler), store.DefaultTimeouts.Request).Handler())
 	}))
 }
 
