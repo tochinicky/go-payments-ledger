@@ -197,3 +197,15 @@ The decisions the build depends on, each with its reason:
 - **Scenario 6 runs through Toxiproxy:** while 8 clients make 120 transfers, the app's database connections are reset in four bursts. Every interim answer is a 503 or a 409, every key ends with exactly one transaction, and the ledger reconciles (posted equals the sum of postings, every transaction sums to zero, one event per account version).
 - **The cost of never freeing a key without proof:** when the conditional release itself is lost to the outage, the key stays leased until its 30 s lease expires, and retries in the meantime get `409 idempotency_in_progress` (in the scenario, most interim answers are these). That is the price of correctness: freeing a key the attempt can't prove it still owns could let a retry run beside a commit that did happen.
 
+## Slice 7: reconciliation, load, deployment
+
+- **Reconciliation recomputes the ledger from its source of truth** (postings, holds, the outbox) and checks invariants 1–4 and 6 over the whole database:
+  - every transaction sums to zero per currency;
+  - posted equals the sum of postings;
+  - available is at or above the floor;
+  - held equals the sum of active holds;
+  - every captured hold's transaction posted exactly the captured amount;
+  - each account has exactly one event per version (account_seq 1…version);
+  - every posting has its event.
+  With `PUBLISHED_WITHIN`, every event older than that must also be published. `cmd/reconcile` prints a PASS/FAIL line per check with up to five examples and exits 1 on any break (2 on an error), so CI and the demo can gate on it. It only reads. The end-to-end tests run it over the whole database after every scenario, and require it to be completely clean.
+

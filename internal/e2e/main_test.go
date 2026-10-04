@@ -286,6 +286,7 @@ func (p partner) checkDelivery(t *testing.T) {
 		t.Errorf("%d accounts whose notifications aren't exactly account_seq 1…version", broken)
 	}
 	p.checkTopicOrder(t)
+	checkLedger(t)
 }
 
 // checkTopicOrder reads the whole topic and checks each of the partner's accounts: the first copy of each event

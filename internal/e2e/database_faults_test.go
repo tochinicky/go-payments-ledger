@@ -87,25 +87,18 @@ func (p apiPartner) post(t *testing.T, base, path, body, key string) reply {
 	return reply{status: resp.StatusCode, body: b, replayed: resp.Header.Get("Idempotent-Replayed") == "true"}
 }
 
-// checkLedger is the reconciliation the database must pass after a fault: every posted balance equals the sum of
-// its postings, every transaction sums to zero, and each account has exactly one event per version.
-func checkLedger(t *testing.T, partner uuid.UUID) {
+// checkLedger runs the full reconciliation (invariants 1–4 and 6) over the whole database: after any fault, every
+// one must hold. Nothing in this package corrupts rows on purpose, so the report must be completely clean.
+func checkLedger(t *testing.T) {
 	t.Helper()
-	var badBalances, badTransactions, badEvents int
-	if err := tdb.Owner.QueryRow(context.Background(), `
-		SELECT
-		  (SELECT count(*) FROM balances b JOIN accounts a ON a.id = b.account_id WHERE a.partner_id = $1
-		     AND b.posted_minor <> (SELECT coalesce(sum(amount_minor), 0) FROM postings p WHERE p.account_id = b.account_id)),
-		  (SELECT count(*) FROM (SELECT transaction_id FROM postings p JOIN accounts a ON a.id = p.account_id
-		     WHERE a.partner_id = $1 GROUP BY transaction_id HAVING sum(amount_minor) <> 0) x),
-		  (SELECT count(*) FROM balances b JOIN accounts a ON a.id = b.account_id WHERE a.partner_id = $1
-		     AND b.version <> (SELECT count(*) FROM outbox o WHERE o.account_id = b.account_id))`,
-		partner).Scan(&badBalances, &badTransactions, &badEvents); err != nil {
+	report, err := store.New(tdb.Owner, store.NewID).Reconcile(context.Background(), 0)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if badBalances+badTransactions+badEvents != 0 {
-		t.Errorf("reconciliation: %d balances off, %d unbalanced transactions, %d accounts whose events don't match their version",
-			badBalances, badTransactions, badEvents)
+	for _, c := range report.Checks {
+		if c.Breaks > 0 {
+			t.Errorf("reconciliation: %s: %d breaks, e.g. %v", c.Name, c.Breaks, c.Examples)
+		}
 	}
 }
 
@@ -138,7 +131,7 @@ func TestScenario8CommitOutcomeUnknown(t *testing.T) {
 	if n != 1 {
 		t.Errorf("%d transfers of 42, want exactly 1", n)
 	}
-	checkLedger(t, p.id)
+	checkLedger(t)
 	_ = proc.Process.Signal(syscall.SIGTERM)
 }
 
@@ -263,5 +256,5 @@ func TestScenario6PostgresConnectionLoss(t *testing.T) {
 	if want := workers * perWorker; keys != want || transfers != want+len(p.accounts) {
 		t.Errorf("%d completed keys and %d transfers, want %d and %d (one transaction per key)", keys, transfers, want, want+len(p.accounts))
 	}
-	checkLedger(t, p.id)
+	checkLedger(t)
 }
