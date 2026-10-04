@@ -23,6 +23,11 @@ linters:
         - name: error-naming
         - name: context-as-argument   # ctx comes first
         - name: unexported-return
+  exclusions:
+    rules:
+      - path: _test\.go                # tests draw random workloads; nothing secret depends on them
+        linters: [gosec]
+        text: G404
 
 formatters:
   enable:

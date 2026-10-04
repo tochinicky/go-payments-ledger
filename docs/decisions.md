@@ -75,3 +75,24 @@ The decisions the build depends on, each with its reason:
 - **Error identity is separate from the API code.** `errors.Is` matches the sentinel an error is, or was made from, never the code: `ErrInvalidAmount`, `ErrInvalidCurrency` and `ErrOverflow` share `validation_failed`, and matching on the code made an overflow look like an ordinary invalid amount. The property test would have accepted a real overflow bug as a normal refusal. It now treats any overflow as a failure. A test pins each sentinel to its documented code.
 - **Version rule:** exactly one bump per account per ledger operation that changes its money (place, capture, release and expire of a hold; each side of a transfer). Each bump becomes one account entry with the next `account_seq`.
 - `CheckInvariants` sums with checked addition, so the checker itself can't overflow silently.
+
+## Slice 2: Postgres, sqlc, accounts and transfers
+
+- **Postgres 18, pgx/v5, sqlc 1.31.1, goose 3.28.** sqlc turns the SQL in `internal/store/queries` into typed Go (`internal/store/db`), so every query is visible SQL and checked against the schema at generate time. Migrations are embedded in the binary (`ledger-api migrate`) and shared with the tests.
+- **Ordered row locks at READ COMMITTED.** A transfer locks both balance rows with one `SELECT … ORDER BY account id FOR UPDATE`, then checks the funds against the locked rows. Two transfers A→B and B→A take the locks in the same order, so neither can wait for the other while holding a lock: no deadlock. Alternatives considered: optimistic locking on `version` (retries under contention, and hot accounts like settlement are always contended); SERIALIZABLE with retry (correct, but every conflict becomes a retry the client never asked for). The lock query is scoped to the partner, so a request can never lock another partner's row.
+- **The rules live in package `ledger`; the store calls them on the locked rows**, in the same order as the in-memory Book, so both refuse the same command with the same error.
+- **Overflow is checked before anything is written**: every new posted balance is computed with checked arithmetic first. Postgres would refuse a `bigint` overflow too, but as a 500, not a business error.
+- **Invariant 1 is also enforced by the database**: a deferred constraint trigger checks at COMMIT that a transaction's postings sum to zero per currency, whatever wrote them.
+- **Append-only (invariant 8) twice over**: the app's role has no UPDATE/DELETE grant on transactions and postings, and triggers refuse UPDATE, DELETE and TRUNCATE even for the owner. Tests prove both.
+- **The app connects as a login role in `ledger_writer`, never as the owner.** The migration creates the grant-holding role without a password; each deployment (and the tests) creates its own login role in it.
+- **A posting's `created_at` is `clock_timestamp()`, taken after the account lock, not `now()`.** `now()` is when the database transaction began, before it waited for the lock. Two transfers on one account could then commit in the opposite order to their timestamps, and a statement page already read could later gain an earlier row, which keyset pagination would skip forever. Taken after the lock, an account's posting times follow its commit order.
+- **Statements use keyset pagination** on `(created_at, id)` with an opaque base64 cursor; a page costs the same at any depth, and new rows can't shift a page. `limit` is 1–200 (default 50).
+- **Settlement accounts are created with their partner** (per currency, floor = −funding limit); the API opens customer accounts only.
+- **Partners authenticate with `Bearer <key>`, looked up by its SHA-256.** Keys are random and high-entropy, so a slow password hash (bcrypt) adds nothing; the lookup is by hash, so timing reveals nothing about the key. Audit logging and rate limits come with the security slice.
+- **Strict request decoding**: unknown fields, trailing data and bodies over 64 KiB are refused (`malformed_json`, `body_too_large`), and `validation_failed` lists every bad field at once. A malformed id in a path is `404`: it can't name anything.
+- **Tests**: one Postgres container per test package (Testcontainers), each test isolated by its own partner.
+  - **Concurrency:** 1,000 random transfers among 10 accounts, 50 workers, sent as opposite-direction pairs. No error but `insufficient_funds` (so no deadlock), money conserved, nothing below its floor, posted = sum of postings, `-race` clean.
+  - **Store vs Book:** a rapid property test runs random transfers against both, and requires the same outcome and the same balances after every step.
+  - **Database guarantees:** append-only (app: permission denied; owner: trigger), an unbalanced transaction can't commit, overflow writes nothing.
+  - **API:** the happy path, statement pagination, and the error catalogue (401, 404 across partners, 400, 413, 422).
+

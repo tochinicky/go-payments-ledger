@@ -26,7 +26,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      # The race detector on every run. Integration tests with Testcontainers join in slice 2;
+      # The race detector on every run. The store and API tests start Postgres with Testcontainers;
       # GitHub's Linux runners have Docker.
       - run: go test -race -count=1 ./...
 
