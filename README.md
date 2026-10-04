@@ -38,3 +38,7 @@ Every write (`POST`) needs an `Idempotency-Key` header (at most 255 characters, 
 `ledger-api migrate` applies the migrations (owner role); `ledger-api` serves on `LISTEN_ADDR` (default `:8080`). Both read `DATABASE_URL`.
 
 - [Decisions](docs/decisions.md)
+
+## Licence
+
+MIT, see [LICENSE](LICENSE).
