@@ -138,7 +138,8 @@ func unavailable(err error) bool {
 	var connectErr *pgconn.ConnectError
 	return errors.As(err, &netErr) || errors.As(err, &connectErr) || pgconn.Timeout(err) ||
 		errors.Is(err, context.DeadlineExceeded) ||
-		errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) // the connection dropped mid-conversation
+		errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) || // the connection dropped mid-conversation
+		errors.Is(err, pgconn.ErrConnClosed) // pgx had already closed it (e.g. it broke during COMMIT)
 }
 
 // writeOK answers a read with 200 and a JSON body. (Writes answer through idempotent, which stores the response.)
