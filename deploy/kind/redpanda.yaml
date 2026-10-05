@@ -7,6 +7,7 @@ metadata:
 data:
   .bootstrap.yaml: |
     auto_create_topics_enabled: false
+    storage_min_free_bytes: 536870912   # dev only: Redpanda refuses writes below this much free disk (default 5 GiB, more than a laptop VM may have)
 ---
 apiVersion: v1
 kind: Service
@@ -43,8 +44,10 @@ spec:
             - --kafka-addr=0.0.0.0:9092
             - --advertise-kafka-addr=redpanda:9092
           ports: [{containerPort: 9092}]
+          # Ready means the broker answers Kafka requests. Not "rpk cluster health": that also reports conditions
+          # such as high disk usage, which shouldn't take the broker's endpoints away.
           readinessProbe:
-            exec: {command: ["sh", "-c", "rpk cluster health | grep -q 'Healthy:.*true'"]}
+            exec: {command: ["rpk", "cluster", "info"]}
             periodSeconds: 3
           resources:
             requests: {cpu: 250m, memory: 1Gi}

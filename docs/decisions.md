@@ -242,6 +242,13 @@ The decisions the build depends on, each with its reason:
   - `terminationGracePeriodSeconds` longer than the drain plus the longest request;
   - non-root, read-only root filesystem, all capabilities dropped, the RuntimeDefault seccomp profile.
 - **The workers:** the relay runs 2 replicas (one leads), and the notifier runs 2 members of one consumer group. Secrets are a template with dev values; a real deployment creates them from its secret store. CI validates every manifest with kubeconform.
+- **A first deployment to a real kind cluster** (2026-10-05, kind and kubectl run from containers) found four problems the schema check couldn't:
+  - **The image's user was a name** (`nonroot`), so Kubernetes couldn't verify `runAsNonRoot` and refused to start the containers. The image now uses the numeric 65532, and the manifests say so too.
+  - **`$$` in a container's arguments is Kubernetes' escape for `$`**, which broke the login-roles SQL. The SQL now comes from a ConfigMap file.
+  - **Redpanda's readiness probe used `rpk cluster health`,** which also fails on high disk usage, so the broker lost its Service endpoints while still able to serve. Readiness is now "the broker answers" (`rpk cluster info`), in Compose too.
+  - **Redpanda refuses writes below `storage_min_free_bytes`** (5 GiB by default), more than this laptop VM had free. Dev clusters set 512 MiB in the bootstrap file.
+  After these fixes the whole system ran in kind: Jobs complete, every pod ready, a transfer through the NodePort, and both its events notified.
+- **A rolling restart of ledger-api under light traffic was not clean:** 67 connection failures and 103 × 503 out of 664 requests. The traffic sent every transfer to the same account, and the cluster ran on a strained VM, so lock waits past the 5 s lock timeout (503) and kube-proxy routing to terminating pods are the likely causes. That isn't verified, so a zero-error rollout isn't claimed. It is the next thing to check: traffic spread over many accounts, a `preStop` sleep alongside `SHUTDOWN_DRAIN`, and the old pods' logs.
 - **The transfer fast path (slice 7b).** A transfer is one pipelined batch while its locks are held:
   - a savepoint;
   - conditional `UPDATE`s of both balances, in account-id order (an `UPDATE` takes the row lock itself, so the order still prevents deadlocks). The debit's `WHERE` is `CanSpend` in SQL: available − amount ≥ floor, where available is posted − held;

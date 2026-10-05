@@ -19,6 +19,25 @@ spec:
             - name: DATABASE_URL
               valueFrom: {secretKeyRef: {name: ledger-db, key: owner-url}}
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: login-roles
+  namespace: ledger
+data:
+  # Dev-only passwords, matching secrets.example.yaml.
+  setup.sql: |
+    DO $$
+    BEGIN
+        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'ledger_app') THEN
+            CREATE ROLE ledger_app LOGIN PASSWORD 'ledger_app' IN ROLE ledger_writer;
+        END IF;
+        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'notifier_app') THEN
+            CREATE ROLE notifier_app LOGIN PASSWORD 'notifier_app' IN ROLE notifier_writer;
+        END IF;
+    END
+    $$;
+---
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -32,24 +51,15 @@ spec:
       containers:
         - name: psql
           image: postgres:18-alpine
-          command: ["sh", "-c"]
-          args:
-            - |
-              psql -v ON_ERROR_STOP=1 "$DATABASE_URL" <<'SQL'
-              DO $$
-              BEGIN
-                  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'ledger_app') THEN
-                      CREATE ROLE ledger_app LOGIN PASSWORD 'ledger_app' IN ROLE ledger_writer;
-                  END IF;
-                  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'notifier_app') THEN
-                      CREATE ROLE notifier_app LOGIN PASSWORD 'notifier_app' IN ROLE notifier_writer;
-                  END IF;
-              END
-              $$;
-              SQL
+          # The SQL comes from a file: in a container's args, Kubernetes would read "$$" as an escaped "$".
+          command: ["sh", "-c", "psql -v ON_ERROR_STOP=1 \"$DATABASE_URL\" -f /sql/setup.sql"]
           env:
             - name: DATABASE_URL
               valueFrom: {secretKeyRef: {name: ledger-db, key: owner-url}}
+          volumeMounts: [{name: sql, mountPath: /sql}]
+      volumes:
+        - name: sql
+          configMap: {name: login-roles}
 ---
 apiVersion: batch/v1
 kind: Job

@@ -13,7 +13,7 @@ spec:
       labels: {app: relay}
     spec:
       terminationGracePeriodSeconds: 20   # longer than the relay's SHUTDOWN_TIMEOUT (15 s)
-      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
       containers:
         - name: relay
           image: go-payments-ledger:dev
@@ -47,7 +47,7 @@ spec:
     metadata:
       labels: {app: notifier}
     spec:
-      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
       containers:
         - name: notifier
           image: go-payments-ledger:dev

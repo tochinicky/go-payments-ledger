@@ -36,7 +36,7 @@ services:
     volumes: ["./deploy/compose/redpanda-bootstrap.yaml:/etc/redpanda/.bootstrap.yaml:ro"]
     ports: ["19092:19092"]
     healthcheck:
-      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      test: ["CMD", "rpk", "cluster", "info"]   # the broker answers (not "cluster health", which also flags disk usage)
       interval: 2s
       retries: 60
 

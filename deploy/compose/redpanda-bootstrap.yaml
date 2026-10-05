@@ -1,2 +1,3 @@
 # Cluster properties applied when the cluster is first created.
 auto_create_topics_enabled: false   # the topic is created explicitly, with its fixed partition count
+storage_min_free_bytes: 536870912   # dev only: Redpanda refuses writes below this much free disk (default 5 GiB, more than a laptop VM may have)
