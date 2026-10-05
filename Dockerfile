@@ -15,6 +15,8 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/ /usr/local/bin/
-USER 65532:65532   # distroless "nonroot", numeric so Kubernetes can verify runAsNonRoot
+# distroless "nonroot", numeric so Kubernetes can verify runAsNonRoot. (Dockerfile comments must be on their own line:
+# text after an instruction becomes part of its arguments.)
+USER 65532:65532
 EXPOSE 8080 9090
 ENTRYPOINT ["/usr/local/bin/ledger-api"]
